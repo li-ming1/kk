@@ -1184,7 +1184,7 @@ static void cursor_abs(int *row, int *col)
  * key translator mangles bracketed-paste markers and Alt chords, which
  * is why multi-line paste never survived the console API. Three
  * consumers share the byte layer — the composer editor, the turn-time
- * queue reader and the session picker — and each brackets its own
+ * input reader and the session picker — and each brackets its own
  * window with term_raw_begin/term_raw_end (they never overlap). */
 #define VT_INPUT_FLAG 0x0200 /* ENABLE_VIRTUAL_TERMINAL_INPUT */
 
@@ -1403,21 +1403,21 @@ static void trunc_cols(char *dst, size_t cap, const char *src, int max_cols)
 static const char *SPIN_FRAMES[] = { "⠋", "⠙", "⠹", "⠸", "⠼",
                                      "⠴", "⠦", "⠧", "⠇", "⠏" };
 
-/* --- queued input (pi-style follow-up / steer) ---------------------------- */
+/* --- typing while a turn runs (interrupt with new input) ------------------ */
 
 /* While a turn runs the composer is dead — keystrokes would pile up in
  * the console buffer and dump into the editor after the turn. A reader
  * thread takes them instead: typing edits a dim staging line pinned
- * under the status rows, Enter moves it to the follow-up queue, which
- * the next model request carries (pi's followUp). Esc sends everything
- * now and interrupts the run (pi's steer); with nothing typed, Esc just
- * cancels, like pi's esc. All state below is guarded by g_out_lock;
- * anything painted under the lock goes through out_write_unlocked. */
+ * under the status rows, Enter interrupts the run right away and the
+ * staged text becomes the user turn the next model request answers.
+ * Esc just cancels, like pi's esc. All state below is guarded by
+ * g_out_lock; anything painted under the lock goes through
+ * out_write_unlocked. */
 
 static char g_stage[4096];            /* staging line bytes (UTF-8) */
 static size_t g_stage_len;
-static struct buf g_queued;           /* queued lines, \n separated */
-static volatile LONG g_steer;         /* esc with content: inject + interrupt */
+static struct buf g_queued;           /* pending new-input lines, \n separated */
+static volatile LONG g_steer;         /* enter with content: inject + interrupt */
 static char g_tick_label[160];        /* running tool for the status line */
 static DWORD g_tick_start;            /* when the running tool started */
 
@@ -1459,8 +1459,7 @@ static void content_note_above(void)
 }
 
 /* The status line: spinner + phase during waits, live counters while
- * streaming, the running tool's label, the queue depth, the model name
- * when idle. */
+ * streaming, the running tool's label, the model name when idle. */
 static void status_repaint(void)
 {
     if (!g_emit_vt || !g_dock)
@@ -1515,14 +1514,7 @@ static void status_repaint(void)
         char fs[16];
         DWORD since = g_tick_label[0] ? g_tick_start : g_turn_start;
         fmt_secs(fs, sizeof fs, (GetTickCount() - since) / 1000);
-        if (g_queued.len) {
-            int qn = 0;
-            for (size_t i = 0; i < g_queued.len; i++)
-                if (g_queued.p[i] == '\n')
-                    qn++;
-            snprintf(tail, sizeof tail, "\x1b[2m · ▏%d · %s\x1b[0m", qn, fs);
-        } else
-            snprintf(tail, sizeof tail, "\x1b[2m · %s\x1b[0m", fs);
+        snprintf(tail, sizeof tail, "\x1b[2m · %s\x1b[0m", fs);
     }
     buf_reset(&g_dock_frame);
     if (g_status_last > row && g_status_last > g_written_row)
@@ -1538,7 +1530,7 @@ static void status_repaint(void)
 }
 
 /* The staging row (directly under the content end): during a turn it
- * shows what the user is typing for the queue — the composer's
+ * shows what the user is typing to interrupt with — the composer's
  * stand-in; idle the row reverts to the editor's menu slot. */
 static void staging_paint(void)
 {
@@ -1560,7 +1552,7 @@ static void staging_paint(void)
         trunc_cols(show, sizeof show, g_stage, g_term_cols - 6);
         buf_appendf(&g_dock_frame, "%s_", show);
     } else {
-        buf_appends(&g_dock_frame, "\x1b[2m输入将排队，Esc 立即发送\x1b[0m");
+        buf_appends(&g_dock_frame, "\x1b[2m回车打断，以新内容继续\x1b[0m");
     }
     if (cr)
         buf_appendf(&g_dock_frame, "\x1b[%d;%dH", cr, cc);
@@ -1664,7 +1656,7 @@ static void user_bars_buf(struct buf *out, const char *text, size_t len)
     buf_appends(out, "\x1b[0m");
 }
 
-/* Echo a queued line as the user turn it becomes (same shape the
+/* Echo a pending line as the user turn it becomes (same shape the
  * composer draws). Main thread, no lock held. */
 static void user_line_show(const char *text)
 {
@@ -1681,10 +1673,11 @@ static void user_line_show(const char *text)
     }
 }
 
-/* Runs while a turn is live: turns keystrokes into the staging line
- * and the follow-up queue. Exits within one poll of g_busy==0. */
+/* Runs while a turn is live: turns keystrokes into the staging line.
+ * Exits within one poll of g_busy==0. */
 
-/* Move the staged line to the follow-up queue (g_out_lock held). */
+/* Hand the staged line over as the next request's content
+ * (g_out_lock held). */
 static void stage_enqueue(void)
 {
     if (g_stage_len) {
@@ -1712,19 +1705,14 @@ static DWORD WINAPI queue_reader_thread(LPVOID arg)
         if (!ReadFile(g_hstdin, buf, sizeof buf, &got, NULL))
             break;
         if (got == 0)
-            continue; /* Ctrl+Z EOF mark: ignore, keep queueing */
+            continue; /* Ctrl+Z EOF mark: ignore */
         for (DWORD i = 0; i < got && (int)g_busy != 0; i++) {
             unsigned char b = buf[i];
             if (b == 0x1B) {
                 unsigned char s;
                 if (term_read_byte_timeout(&s, 50) <= 0) {
-                    /* lone esc: steer or plain cancel */
-                    AcquireSRWLockExclusive(&g_out_lock);
-                    stage_enqueue();
-                    if (g_queued.len)
-                        InterlockedExchange(&g_steer, 1);
+                    /* lone esc: plain cancel */
                     InterlockedExchange(&g_cancel, 1);
-                    ReleaseSRWLockExclusive(&g_out_lock);
                 } else if (s == '[' || s == 'O') {
                     /* a terminal sequence (arrows, paste markers):
                      * drain it — arrow keys never steer or cancel */
@@ -1743,7 +1731,13 @@ static DWORD WINAPI queue_reader_thread(LPVOID arg)
                     g_stage_len--;
                 g_stage[g_stage_len] = '\0';
             } else if (b == '\r' || b == '\n') {
+                /* enter with content: interrupt the run now and let the
+                 * staged text drive the next request */
                 stage_enqueue();
+                if (g_queued.len) {
+                    InterlockedExchange(&g_steer, 1);
+                    InterlockedExchange(&g_cancel, 1);
+                }
             } else if (b >= 0x20 && b != 0x7F) {
                 /* raw UTF-8 bytes append directly: multi-byte chars
                  * assemble themselves in the staging line */
@@ -9014,8 +9008,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         InterlockedExchange(&g_cancel, 0);
         InterlockedExchange(&g_painted, 0);
         g_stream_bytes = 0;
-        /* follow-up queue: everything typed last round joins this
-         * request without interrupting (pi's followUp) */
+        /* race safety: input that landed as the last round ended (too
+         * late to interrupt) joins this request without interrupting */
         turn_feed_queue(cv, slog);
         dock_repaint();
         InterlockedExchange(&g_busy, 1);
@@ -9062,7 +9056,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
 
             if (status == -1) {
                 if (InterlockedCompareExchange(&g_steer, 0, 0)) {
-                    /* esc steer: the queued text becomes the user turn
+                    /* enter steer: the new text becomes the user turn
                      * the model answers right now */
                     InterlockedExchange(&g_steer, 0);
                     stream_state_free(&st);
@@ -9130,8 +9124,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             }
             stream_state_free(&st);
             if (queue_pending()) {
-                /* a follow-up landed during the final stream: the turn
-                 * continues with it instead of ending */
+                /* input landed during the final stream (too late to
+                 * interrupt): the turn continues with it */
                 turn_feed_queue(cv, slog);
                 continue;
             }
@@ -9218,7 +9212,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         stream_state_free(&st);
         if (cancelled) {
             if (InterlockedCompareExchange(&g_steer, 0, 0)) {
-                /* esc steer out of a tool run: the queued text drives
+                /* enter steer out of a tool run: the new text drives
                  * the next round instead of ending the turn */
                 InterlockedExchange(&g_steer, 0);
                 turn_feed_queue(cv, slog);
