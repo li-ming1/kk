@@ -1316,6 +1316,9 @@ static void out_write_unlocked(const char *s, size_t n)
  * out_frame_* variants which write without seeking. All under g_out_lock. */
 static SHORT g_content_x, g_content_y; /* buffer coords, -1 = unset */
 static int g_no_seek; /* full-screen overlays (session picker) write raw */
+static int g_region_bottom = -1; /* viewport row of the scroll region's
+                                  * bottom (= panel top - 1); the region
+                                  * tracks the panel's actual height */
 
 /* Seek to the tracked content end and re-track after a write. Lock held. */
 static void content_seek_write(const char *s, size_t n)
@@ -1329,6 +1332,23 @@ static void content_seek_write(const char *s, size_t n)
         }
         g_content_x = csbi.dwCursorPosition.X;
         g_content_y = csbi.dwCursorPosition.Y;
+    }
+    if (g_console_out && GetConsoleScreenBufferInfo(g_hstdout, &csbi)
+        && g_region_bottom > 0) {
+        /* chat-style bottom alignment: when the transcript ends above the
+         * region bottom, scroll the region down so output hugs the panel
+         * and the spare rows live at the top (future scrollback). Once
+         * aligned the region scrolls normally and the gap stays zero. */
+        int rbottom = csbi.srWindow.Top + g_region_bottom - 1;
+        int gap = rbottom - g_content_y;
+        if (gap > 0) {
+            if (gap > g_region_bottom)
+                gap = g_region_bottom;
+            char sd[24];
+            int sn = snprintf(sd, sizeof sd, "\x1b[%dT", gap);
+            out_write_unlocked(sd, (size_t)sn);
+            g_content_y = (SHORT)(g_content_y + gap);
+        }
     }
     if (g_console_out)
         SetConsoleCursorPosition(
@@ -1495,13 +1515,6 @@ static struct buf g_queued;           /* pending new-input lines, \n separated *
 static volatile LONG g_steer;         /* enter with content: inject + interrupt */
 static char g_tick_label[160];        /* running tool for the status line */
 static DWORD g_tick_start;            /* when the running tool started */
-
-/* Last row of the scroll region: just above the tallest possible panel. */
-static int dock_scroll_bottom(void)
-{
-    int b = g_term_rows - 13;
-    return b > 0 ? b : 1;
-}
 
 /* Fixed dock: the composer panel pins to the bottom edge (rule + draft
  * window + hint + rule + status, 4..13 rows tall) and every painter
@@ -7094,6 +7107,26 @@ static void edit_render(struct editor *e)
     if (e->home_row < 1)
         e->home_row = 1;
 
+    /* the scroll region tracks the panel's actual height: its bottom is
+     * the row just above the panel's top rule, so transcript output
+     * bottom-aligns against the panel with no reserved dead rows. When
+     * the panel grows, shift the transcript up first (SU under the old
+     * region) so the draft never covers it. */
+    int rb = e->home_row - 1;
+    int rise = old_drawn > 0 ? old_home - e->home_row : 0;
+    if (rise > 0) {
+        AcquireSRWLockExclusive(&g_out_lock);
+        g_content_y = (SHORT)(g_content_y - rise);
+        char su[24];
+        int sn = snprintf(su, sizeof su, "\x1b[%dS", rise);
+        out_write_unlocked(su, (size_t)sn);
+        ReleaseSRWLockExclusive(&g_out_lock);
+    }
+    if (rb != g_region_bottom && rb >= 1) {
+        g_region_bottom = rb;
+        buf_appendf(&frame, "\x1b[1;%dr", rb);
+    }
+
     /* the frame always paints from its top rule: whatever the console
      * cursor is doing, the draft lands where the dock put it */
     buf_appendf(&frame, "\x1b[%d;1H", e->home_row);
@@ -7732,9 +7765,9 @@ static enum edit_result edit_line(struct editor *e, char **out)
                 if (last_busy && !busy)
                     out_frame_puts("\x1b[?25h"); /* the caret comes home */
                 last_busy = busy;
-                out_frame_printf("\x1b[1;%dr", dock_scroll_bottom());
                 /* the old frame's rows are stale after a reflow: erase
-                 * them before the repaint re-docks the panel */
+                 * them before the repaint re-docks the panel (the region
+                 * itself is re-emitted inside edit_render) */
                 if (e->drawn_rows > 0) {
                     int last = e->home_row + e->drawn_rows;
                     for (int r = e->home_row;
@@ -8360,12 +8393,12 @@ static int run_repl(struct config *cfg)
     if (dock) {
         term_size_refresh();
         dock_row = g_term_rows;
-        out_frame_printf("\x1b[1;%dr", dock_scroll_bottom());
         /* the transcript must start at viewport row 1: the scroll region
          * (DECSTBM) is viewport-relative, so old pane content above the
          * session would put the content end outside the region and
          * streaming would plow straight through the panel. 2J keeps the
-         * pane's scrollback, only the visible screen is cleared. */
+         * pane's scrollback, only the visible screen is cleared. The
+         * region itself is owned by edit_render (tracks panel height). */
         out_puts("\x1b[H\x1b[2J");
     }
 
@@ -8395,7 +8428,6 @@ static int run_repl(struct config *cfg)
             term_size_refresh();
             if (dock_row != g_term_rows) {
                 dock_row = g_term_rows; /* re-anchor after a resize */
-                out_frame_printf("\x1b[1;%dr", dock_scroll_bottom());
             }
             /* the composer panel owns the docked bottom rows */
             er = edit_line(&ed, &line);
