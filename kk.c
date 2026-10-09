@@ -9136,8 +9136,9 @@ static int64_t compact_window_tokens(void)
  * that can grow without bound inside one turn. The stubs are transient
  * for the retried request; the session log already holds the real
  * output it recorded, and the screen showed it live. Returns 1 when
- * something was stubbed. */
-static int conv_stub_tool_results(struct conversation *cv)
+ * something was stubbed and, if `freed` is given, reports the bytes
+ * it removed from what the next request will carry. */
+static int conv_stub_tool_results(struct conversation *cv, size_t *freed)
 {
     size_t last = cv->msgs.n;
     for (size_t i = cv->msgs.n; i > 0; i--)
@@ -9175,8 +9176,9 @@ static int conv_stub_tool_results(struct conversation *cv)
     }
     if (!n)
         return 0;
-    out_printf("⚠ 本轮早前的 %d 条工具输出（共 %zu 字节）已替换为占位，"
-               "以腾出上下文\r\n",
+    if (freed)
+        *freed = bytes;
+    out_printf("⚠ %d 条较早的工具输出（共 %zu 字节）已换成占位，腾出上下文\r\n",
                n, bytes);
     return 1;
 }
@@ -9447,7 +9449,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 out_puts("⚠ 上下文超限，尝试压缩后重试\r\n");
                 int recovered = conv_compact(cfg, cv, slog);
                 if (!recovered)
-                    recovered = conv_stub_tool_results(cv);
+                    recovered = conv_stub_tool_results(cv, NULL);
                 if (recovered) {
                     compacted_once = 1;
                     stream_state_free(&st);
@@ -9628,6 +9630,17 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
      * at a quarter of the real usage and fold away live history. */
     int64_t prompt_now = turn_usage ? g_ctx_tokens
                                     : (int64_t)(last_request_bytes / 2);
+    /* Tool output is the bulk of what every later round re-pays, and the
+     * one thing the model can always fetch back with a tool call. Take it
+     * back first: it costs no request, so a turn that would have needed a
+     * summarizer round may not need one at all. */
+    if (rc == 0 && auto_compact && prompt_now >= compact_window_tokens() / 4) {
+        size_t freed = 0;
+        if (conv_stub_tool_results(cv, &freed)) {
+            int64_t est = (int64_t)(freed / 2); /* ~1 token per 2 bytes */
+            prompt_now = est < prompt_now ? prompt_now - est : 0;
+        }
+    }
     if (rc == 0 && auto_compact && prompt_now >= compact_window_tokens() / 4 * 3)
         conv_compact(cfg, cv, slog);
     InterlockedExchange(&g_busy, 0);
