@@ -8396,10 +8396,10 @@ static int run_repl(struct config *cfg)
         /* the transcript must start at viewport row 1: the scroll region
          * (DECSTBM) is viewport-relative, so old pane content above the
          * session would put the content end outside the region and
-         * streaming would plow straight through the panel. 2J keeps the
-         * pane's scrollback, only the visible screen is cleared. The
+         * streaming would plow straight through the panel. 3J wipes the
+         * scrollback too — a fresh session owns the whole pane. The
          * region itself is owned by edit_render (tracks panel height). */
-        out_puts("\x1b[H\x1b[2J");
+        out_puts("\x1b[H\x1b[2J\x1b[3J");
     }
 
     repl_banner();
