@@ -1421,41 +1421,18 @@ static volatile LONG g_steer;         /* enter with content: inject + interrupt 
 static char g_tick_label[160];        /* running tool for the status line */
 static DWORD g_tick_start;            /* when the running tool started */
 
-/* Fixed dock: the composer bar and status line trail the content end
- * (no dead void under short output) and pin to the last two rows once
- * the transcript fills — from there the scroll region shields them
- * from content forever. Every row has exactly one painter. */
+/* Fixed dock: the composer panel pins to the bottom edge (rule + draft
+ * window + hint + rule + status, 4..13 rows tall) and every painter
+ * writes absolute rows; the scroll region ends above the tallest panel
+ * so transcript output scrolls behind it and the panel never vanishes. */
 static volatile LONG g_frame; /* spinner animation frame */
-static int g_stage_last, g_status_last; /* last rows our painters drew */
-static int g_written_row;               /* last row transcript chars hit */
-
-/* Scratch frame for every dock painter: all four run under the exclusive
- * g_out_lock and never nest, so one buffer serves them all. */
 static struct buf g_dock_frame;
 
-/* Transcript writers note the deepest row they put characters on: dock
- * rows at or below it have been consumed by the transcript and must
- * never be erased; rows above it are still ours to clear. Written on
- * the agent thread, read by the spinner and queue readers under the
- * lock — the write takes it too, or a stale value lets a painter erase
- * a row the transcript just consumed. */
-static void content_note(int row)
+/* Last row of the scroll region: just above the tallest possible panel. */
+static int dock_scroll_bottom(void)
 {
-    if (!g_dock)
-        return;
-    AcquireSRWLockExclusive(&g_out_lock);
-    if (row > g_written_row)
-        g_written_row = row;
-    ReleaseSRWLockExclusive(&g_out_lock);
-}
-
-/* The row just above the cursor: writers that end with CRLF leave the
- * cursor on the next row, the characters landed on the previous one. */
-static void content_note_above(void)
-{
-    int r = 0, c = 0;
-    cursor_abs(&r, &c);
-    content_note(r > 0 ? r - 1 : 0);
+    int b = g_term_rows - 13;
+    return b > 0 ? b : 1;
 }
 
 /* The status line: spinner + phase during waits, live counters while
@@ -1467,9 +1444,7 @@ static void status_repaint(void)
     AcquireSRWLockExclusive(&g_out_lock);
     int cr = 0, cc = 0;
     cursor_abs(&cr, &cc);
-    int row = (cr > 0 ? cr : 1) + 2;
-    if (row > g_term_rows)
-        row = g_term_rows;
+    int row = g_term_rows; /* the panel's status row: last on screen */
     char line[512];
     int busy = (int)g_busy;
     if (busy == 1) {
@@ -1517,9 +1492,6 @@ static void status_repaint(void)
         snprintf(tail, sizeof tail, "\x1b[2m · %s\x1b[0m", fs);
     }
     buf_reset(&g_dock_frame);
-    if (g_status_last > row && g_status_last > g_written_row)
-        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K", g_status_last);
-    g_status_last = row;
     buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K%s%s\x1b[0K", row, line,
                 tail);
     if (cr)
@@ -1529,9 +1501,8 @@ static void status_repaint(void)
     ReleaseSRWLockExclusive(&g_out_lock);
 }
 
-/* The staging row (directly under the content end): during a turn it
- * shows what the user is typing to interrupt with — the composer's
- * stand-in; idle the row reverts to the editor's menu slot. */
+/* The staged interrupt text: during a turn it shows in the docked
+ * panel's draft row — the composer's stand-in while output streams. */
 static void staging_paint(void)
 {
     if (!g_emit_vt || !g_dock)
@@ -1539,20 +1510,16 @@ static void staging_paint(void)
     AcquireSRWLockExclusive(&g_out_lock);
     int cr = 0, cc = 0;
     cursor_abs(&cr, &cc);
-    int row = (cr > 0 ? cr : 1) + 1;
-    if (row > g_term_rows - 1)
-        row = g_term_rows - 1;
+    int row = g_term_rows - 2; /* the panel's single draft row */
     buf_reset(&g_dock_frame);
-    if (g_stage_last > row && g_stage_last > g_written_row)
-        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K", g_stage_last);
-    g_stage_last = row;
-    buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K\x1b[1m▌\x1b[0m ", row);
     if (g_stage_len) {
         char show[1600];
         trunc_cols(show, sizeof show, g_stage, g_term_cols - 6);
-        buf_appendf(&g_dock_frame, "%s_", show);
+        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K\x1b[1m▌\x1b[0m %s_",
+                    row, show);
     } else {
-        buf_appends(&g_dock_frame, "\x1b[2m回车打断，以新内容继续\x1b[0m");
+        /* nothing staged: leave the draft row empty */
+        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K", row);
     }
     if (cr)
         buf_appendf(&g_dock_frame, "\x1b[%d;%dH", cr, cc);
@@ -1561,8 +1528,8 @@ static void staging_paint(void)
     ReleaseSRWLockExclusive(&g_out_lock);
 }
 
-/* Repaint both dock rows: every transcript write can consume them, so
- * writers call this right after printing. */
+/* Repaint the dock's busy rows: during a turn the staged text and the
+ * status line live in the docked panel's draft and status rows. */
 static void dock_repaint(void)
 {
     if (!g_dock)
@@ -1571,46 +1538,20 @@ static void dock_repaint(void)
         staging_paint();
         status_repaint();
     } else {
-        /* idle: the staging row reverts to the editor's menu slot */
+        /* idle: clear the staged text left by the turn, then put the
+         * model line back onto the status row */
         AcquireSRWLockExclusive(&g_out_lock);
         int cr = 0, cc = 0;
         cursor_abs(&cr, &cc);
-        int row = (cr > 0 ? cr : 1) + 1;
-        if (row > g_term_rows - 1)
-            row = g_term_rows - 1;
         buf_reset(&g_dock_frame);
-        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K", row);
+        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K", g_term_rows - 2);
         if (cr)
             buf_appendf(&g_dock_frame, "\x1b[%d;%dH", cr, cc);
         if (g_dock_frame.len)
             out_write_unlocked(g_dock_frame.p, g_dock_frame.len);
         ReleaseSRWLockExclusive(&g_out_lock);
+        status_repaint();
     }
-}
-
-/* A transcript write is about to run downward from the cursor: clear
- * our dock rows it would plow through (they are still ours as long as
- * the transcript has not written that far). */
-static void dock_yield(void)
-{
-    if (!g_dock || (!g_stage_last && !g_status_last))
-        return;
-    AcquireSRWLockExclusive(&g_out_lock);
-    buf_reset(&g_dock_frame);
-    if (g_stage_last > g_written_row)
-        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K", g_stage_last);
-    if (g_status_last > g_written_row)
-        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K", g_status_last);
-    g_stage_last = 0;
-    g_status_last = 0;
-    if (g_dock_frame.len) {
-        int cr = 0, cc = 0;
-        cursor_abs(&cr, &cc);
-        if (cr)
-            buf_appendf(&g_dock_frame, "\x1b[%d;%dH", cr, cc);
-        out_write_unlocked(g_dock_frame.p, g_dock_frame.len);
-    }
-    ReleaseSRWLockExclusive(&g_out_lock);
 }
 
 /* pi's user-message echo: the text wraps at the terminal width and every
@@ -1660,14 +1601,12 @@ static void user_bars_buf(struct buf *out, const char *text, size_t len)
  * composer draws). Main thread, no lock held. */
 static void user_line_show(const char *text)
 {
-    dock_yield();
     if (g_emit_vt) {
         struct buf b = BUF_INIT;
         user_bars_buf(&b, text, strlen(text));
         buf_appends(&b, "\r\n");
         out_write(b.p, b.len);
         buf_free(&b);
-        content_note_above();
     } else {
         out_printf("> %s\r\n", text);
     }
@@ -1754,14 +1693,6 @@ static DWORD WINAPI queue_reader_thread(LPVOID arg)
     }
     term_raw_end(saved);
     return 0;
-}
-
-/* The cursor's 1-based row in the visible window, or -1. */
-static int cursor_screen_row(void)
-{
-    int r = 0, c = 0;
-    cursor_abs(&r, &c);
-    return r > 0 ? r : -1;
 }
 
 /* Turn end: drop the staged half-line (the composer the editor draws
@@ -2305,18 +2236,10 @@ static void painter_screen(struct painter *p)
     if (p->shown < p->pending.len) {
         out_write(p->pending.p + p->shown, p->pending.len - p->shown);
         p->shown = p->pending.len;
-        /* the dock painters are the only consumers of the written row:
-         * skip the cursor syscall when the dock is off (-p mode pays
-         * one less syscall per committed row) */
-        if (g_dock) {
-            int r = 0, c = 0;
-            cursor_abs(&r, &c);
-            content_note(r);
-        }
     }
     p->row_shown = 1;
     if (g_dock && g_busy)
-        dock_repaint(); /* content consumed the dock rows: re-pin them */
+        dock_repaint(); /* keep the staged text and status fresh */
 }
 
 /* Commit the pending row: sync the screen and end the line. The row
@@ -6178,12 +6101,10 @@ static char *tool_execute(const char *name, const struct jnode *args)
 
 static void tool_show_call(const char *name, const char *summary)
 {
-    dock_yield();
     if (g_emit_vt)
         out_printf("\x1b[36m● %s\x1b[0m  %s\r\n", name, summary);
     else
         out_printf("* %s  %s\r\n", name, summary);
-    content_note_above();
 }
 
 static void tool_show_exit(const char *output)
@@ -6195,17 +6116,14 @@ static void tool_show_exit(const char *output)
         n = sizeof first - 1;
     memcpy(first, output, n);
     first[n] = '\0';
-    dock_yield();
     if (g_emit_vt)
         out_printf("\x1b[2m  %s\x1b[0m\r\n", first);
     else
         out_printf("  %s\r\n", first);
-    content_note_above();
 }
 
 static void tool_show_output(const char *output)
 {
-    dock_yield();
     /* skip the "exit N" first line; trim blank edges (shells pad); the
      * rest is dim-indented two columns, batched into one console write */
     const char *nl = strchr(output, '\n');
@@ -6248,7 +6166,6 @@ static void tool_show_output(const char *output)
         buf_appends(&b, "\x1b[0m");
     buf_appends(&b, "\r\n");
     out_write(b.p, b.len);
-    content_note_above();
     buf_free(&b);
 }
 /* ==========================================================================
@@ -6816,7 +6733,6 @@ static void session_reset_screen(void)
     if (!g_emit_vt)
         return;
     out_puts("\x1b[0m\x1b[2J\x1b[3J\x1b[H");
-    g_written_row = 0; /* the cleared screen owns no transcript rows */
 }
 
 /* Re-render a loaded conversation onto the cleared screen: the same
@@ -7008,7 +6924,9 @@ struct editor {
     int saved_valid;
     int home_row;   /* screen row the draft frame starts on (1-based) */
     int drawn_rows; /* rows the last frame occupied: shrink erases them */
-    int menu_base;  /* first menu row on screen (just below the composer) */
+    int content_row; /* transcript end captured at edit start */
+    int content_col; /* the submit echo and post-edit output grow here */
+    int menu_base;  /* first menu row on screen (menu opens above the panel) */
     int menu_count; /* entries currently drawn */
     int menu_from;  /* sliding window start */
     int menu_open;  /* a menu is on screen: covered rows are captured */
@@ -7161,21 +7079,16 @@ static int edit_window(const struct editor *e, int wcap, struct edit_vrow *rows,
     return filled;
 }
 
-/* Visible-row budget for the composer frame at its current home row:
- * the region below home_row minus the rules, the more-hint and the
- * status row. Both the render and the cursor positioning derive the
- * window from this, so they always agree. */
-static int edit_window_cap(const struct editor *e)
+/* Visible-row budget for the docked composer's draft window: up to
+ * EDIT_WINDOW_ROWS, shrinking only on tiny terminals so the panel fits
+ * between the scroll region and the screen bottom. */
+static int edit_window_cap(void)
 {
-    int bottom = g_term_rows - 2;
-    int avail = bottom - e->home_row + 1;
-    if (avail < 4)
-        avail = 4;
-    int wcap = avail - 4;
-    if (wcap < 1)
-        wcap = 1;
+    int wcap = g_term_rows - 6;
     if (wcap > EDIT_WINDOW_ROWS)
         wcap = EDIT_WINDOW_ROWS;
+    if (wcap < 1)
+        wcap = 1;
     return wcap;
 }
 
@@ -7200,7 +7113,7 @@ static int edit_cursor_ctl(const struct editor *e, char *ctl, size_t cap)
     edit_walk(e->text.p, e->cur, cols, &br, &bc);
     /* the frame stacks a rule above the window, so the cursor's screen
      * row is home_row + 1 + (its draft row - window start) */
-    int wcap = edit_window_cap(e);
+    int wcap = edit_window_cap();
     int lo = br > wcap - 1 ? (int)br - (wcap - 1) : 0;
     return edit_cursor_ctl_at(e, bc, (int)br, lo, ctl, cap);
 }
@@ -7226,18 +7139,20 @@ static void edit_render(struct editor *e)
     struct edit_vrow rows[EDIT_WINDOW_ROWS];
     int lo = 0, total = 0, cur_row = 0;
     size_t cur_col = 0;
-    /* the window never displaces the transcript: it shrinks to the rows
-     * available between home_row and the dock region's bottom —
-     * scrolling the transcript to make room pushed the conversation out
-     * of view and left the panel floating mid-screen */
-    int wcap = edit_window_cap(e);
+    int wcap = edit_window_cap();
     int shown = edit_window(e, wcap, rows, &lo, &cur_row, &cur_col, &total);
     int above = lo, below = total - lo - shown;
     int hint = above > 0 || below > 0;
     int need = 2 + shown + hint + 1; /* rules + rows + hint + status row */
+    /* bottom dock: the panel's last row pins to the screen bottom, so
+     * the top edge rises as the draft grows — output scrolls above the
+     * panel in the scroll region and never displaces it */
+    e->home_row = g_term_rows - need + 1;
+    if (e->home_row < 1)
+        e->home_row = 1;
 
-    /* the frame always paints from the draft's home row: whatever the
-     * console cursor is doing, the draft lands where it started */
+    /* the frame always paints from its top rule: whatever the console
+     * cursor is doing, the draft lands where the dock put it */
     buf_appendf(&frame, "\x1b[%d;1H", e->home_row);
     edit_rule_append(&frame);
     for (int i = 0; i < shown; i++) {
@@ -7273,17 +7188,13 @@ static void edit_render(struct editor *e)
     buf_appends(&frame, "\x1b[0m\x1b[0K");
     }
 
-    /* shrink erase: rows the previous frame spanned but this one doesn't
-     * (positions shift with a scroll, so anchor them to the old home) */
-    if (!e->menu_open) {
-        int old_last = old_home + old_drawn - 1;
-        int new_last = e->home_row + need - 1;
-        for (int r = new_last + 1; r <= old_last; r++)
+    /* the panel is bottom-pinned: growth and shrink move the top edge,
+     * so erase rows the previous frame spanned above the new top */
+    if (!e->menu_open && old_drawn > 0) {
+        for (int r = old_home; r < e->home_row; r++)
             buf_appendf(&frame, "\x1b[%d;1H\x1b[2K", r);
     }
     e->drawn_rows = need;
-    if (!e->menu_open)
-        e->menu_base = e->home_row + need; /* menu below the status row */
     char ctl[48];
     int cn = edit_cursor_ctl_at(e, cur_col, cur_row, lo, ctl, sizeof ctl);
     buf_append_n(&frame, ctl, (size_t)cn);
@@ -7549,13 +7460,13 @@ static int edit_menu_candidate(const struct editor *e)
         && e->text.len < 32;
 }
 
-/* Draw / clear the command panel overlay. The panel starts just below the
- * composer (never covering it) and is height-clamped to the screen: near
- * the bottom it shrinks to a chromeless entry list so '/' always works.
- * Ends with the cursor back on the composer row. */
+/* Draw / clear the command panel overlay. The panel opens above the
+ * docked composer (its bottom edge sits on the panel's top rule) and is
+ * height-clamped to the rows above so '/' always works. Ends with the
+ * cursor back on the draft. */
 static void edit_menu_draw(struct editor *e)
 {
-    if (!e->menu_base || !g_emit_vt)
+    if (!g_emit_vt)
         return;
     int match[KK_N_COMMANDS];
     int count = 0;
@@ -7572,8 +7483,8 @@ static void edit_menu_draw(struct editor *e)
             menu_restore();
             e->menu_open = 0;
             /* the restore leaves the cursor wherever WriteConsoleOutputW
-             * lands it: only then does the composer row need re-seeking */
-            out_printf("\x1b[%d;1H", e->menu_base - 1);
+             * lands it: only then does the draft need re-seeking */
+            edit_cursor_pos(e);
         }
         e->menu_count = 0;
         return;
@@ -7581,11 +7492,12 @@ static void edit_menu_draw(struct editor *e)
     if (!e->menu_open) {
         /* open: fix the geometry and capture the covered rows once */
         int height = 4 + (count < EDIT_MENU_MAX ? count : EDIT_MENU_MAX);
-        int avail = g_term_rows - e->menu_base + 1;
+        int avail = e->home_row - 1; /* rows above the composer panel */
         if (height > avail)
             height = avail;
         if (height < 1)
             return;
+        e->menu_base = e->home_row - height;
         menu_capture(e->menu_base, height);
         e->menu_height = height;
         e->menu_open = 1;
@@ -7640,7 +7552,7 @@ static void edit_menu_draw(struct editor *e)
     e->menu_count = count;
     if (count)
         memcpy(e->menu_match, match, (size_t)count * sizeof match[0]);
-    out_printf("\x1b[%d;1H", e->menu_base - 1); /* back to the composer row */
+    edit_cursor_pos(e); /* back onto the draft */
 }
 
 static void edit_menu_clear(struct editor *e)
@@ -7651,8 +7563,8 @@ static void edit_menu_clear(struct editor *e)
     e->menu_count = 0;
     e->menu_open = 0;
     /* the restore leaves the cursor wherever WriteConsoleOutputW lands it;
-     * put it back on the composer row */
-    out_printf("\x1b[%d;1H", e->menu_base - 1);
+     * put it back on the draft */
+    edit_cursor_pos(e);
 }
 
 /* Full repaint: the draft frame first (its shrink-erase frees rows),
@@ -7787,35 +7699,26 @@ static enum edit_result edit_read_cooked(char **out)
     return *out ? EDIT_LINE : EDIT_EOF;
 }
 
-/* Erase the composer frame (rules, rows, hint, status). Main thread. */
-static void edit_frame_erase(struct editor *e)
-{
-    struct buf b = BUF_INIT;
-    int last = e->home_row + e->drawn_rows - 1;
-    for (int r = e->home_row; r <= last; r++)
-        buf_appendf(&b, "\x1b[%d;1H\x1b[2K", r);
-    if (b.len) {
-        buf_appendf(&b, "\x1b[%d;1H", e->home_row);
-        out_write(b.p, b.len);
-    }
-    buf_free(&b);
-}
-
-/* Submit echo: the composer frame is replaced by pi-style cyan bars of
- * the draft — what stays on screen is exactly the message the model
- * sees. Main thread. */
+/* Submit echo: pi-style cyan bars of the draft print at the content end
+ * (captured at edit start) — the transcript shows exactly the message
+ * the model sees, and the docked panel repaints empty beneath it. Main
+ * thread. */
 static void edit_submit_echo(struct editor *e)
 {
     static struct buf b; /* editor runs on the main thread only */
     buf_reset(&b);
-    int last = e->home_row + e->drawn_rows - 1;
-    for (int r = e->home_row; r <= last; r++)
-        buf_appendf(&b, "\x1b[%d;1H\x1b[2K", r);
-    buf_appendf(&b, "\x1b[%d;1H", e->home_row);
+    buf_appendf(&b, "\x1b[%d;%dH", e->content_row, e->content_col);
     user_bars_buf(&b, e->text.p, e->text.len);
     buf_appends(&b, "\r\n");
     out_write(b.p, b.len);
-    content_note_above();
+    /* the bars are transcript now: re-anchor so the post-edit cursor
+     * (and the following output) appends after them, not over them */
+    int cr = 0, cc = 0;
+    cursor_abs(&cr, &cc);
+    if (cr > 0) {
+        e->content_row = cr;
+        e->content_col = cc > 0 ? cc : 1;
+    }
 }
 
 static enum edit_result edit_line(struct editor *e, char **out)
@@ -7836,33 +7739,18 @@ static enum edit_result edit_line(struct editor *e, char **out)
     e->menu_height = 0;
     e->menu_open = 0;
     e->menu_base = 0;
-    /* anchor every frame to the row the draft starts on */
-    e->home_row = cursor_screen_row();
-    if (e->home_row < 1)
-        e->home_row = 1;
-    /* reserve the panel's arena once, up front: rules + window + hint +
-     * status must fit above the dock region's bottom, or every render
-     * would push the region around and stack stale frames. One scroll
-     * at open keeps the whole session's renders scroll-free. */
+    /* capture where the transcript ends: the submit echo and everything
+     * after the edit grow from this spot (the panel itself is docked to
+     * the screen bottom, no scroll reservation needed) */
     {
-        int bottom = g_term_rows - 2;
-        int max_need = 2 + EDIT_WINDOW_ROWS + 1 + 1;
-        if (e->home_row + max_need - 1 > bottom) {
-            int scroll = e->home_row + max_need - 1 - bottom;
-            if (scroll > e->home_row - 1)
-                scroll = e->home_row - 1; /* degenerate tiny terminals */
-            if (scroll > 0) {
-                out_printf("\x1b[%d;1H", bottom);
-                for (int i = 0; i < scroll; i++)
-                    out_puts("\r\n");
-                e->home_row -= scroll;
-                /* the transcript rows shifted with the scroll */
-                if (g_written_row > scroll)
-                    g_written_row -= scroll;
-                else
-                    g_written_row = 0;
-            }
-        }
+        int cr = 0, cc = 0;
+        cursor_abs(&cr, &cc);
+        if (cr < 1 || cr > dock_scroll_bottom())
+            cr = dock_scroll_bottom();
+        if (cc < 1)
+            cc = 1;
+        e->content_row = cr;
+        e->content_col = cc;
     }
     e->drawn_rows = 0;
     edit_repaint(e);
@@ -7872,6 +7760,7 @@ static enum edit_result edit_line(struct editor *e, char **out)
 
     enum edit_result result = EDIT_EOF;
     int leave = 0;
+    struct buf submitted = BUF_INIT; /* the draft, stolen at submit */
     int last_cols = g_term_cols, last_rows = g_term_rows;
     while (!leave) {
         unsigned char b;
@@ -7881,9 +7770,19 @@ static enum edit_result edit_line(struct editor *e, char **out)
             if (g_term_cols != last_cols || g_term_rows != last_rows) {
                 last_cols = g_term_cols;
                 last_rows = g_term_rows;
-                e->home_row = cursor_screen_row();
-                if (e->home_row < 1)
-                    e->home_row = 1;
+                out_printf("\x1b[1;%dr", dock_scroll_bottom());
+                if (e->content_row > dock_scroll_bottom())
+                    e->content_row = dock_scroll_bottom();
+                if (e->content_row < 1)
+                    e->content_row = 1;
+                /* the old frame's rows are stale after a reflow: erase
+                 * them before the repaint re-docks the panel */
+                if (e->drawn_rows > 0) {
+                    int last = e->home_row + e->drawn_rows;
+                    for (int r = e->home_row;
+                         r < last && r <= g_term_rows; r++)
+                        out_printf("\x1b[%d;1H\x1b[2K", r);
+                }
                 e->drawn_rows = 0;
                 edit_repaint(e);
             }
@@ -8019,13 +7918,17 @@ static enum edit_result edit_line(struct editor *e, char **out)
                 edit_render(e); /* echo the completed line */
             }
             edit_menu_clear(e);
-            if (e->text.len && e->text.p[0] != '/') {
-                /* pi-style echo: the cyan-bar message replaces the frame,
-                 * so what stays on screen is what the model will see */
-                edit_submit_echo(e);
-            } else {
-                out_puts("\r\n");
+            if (e->text.len && e->text.p[0] != '/')
+                edit_submit_echo(e); /* cyan bars at the content end */
+            {
+                /* the draft moves to the transcript; the docked panel
+                 * stays up, empty, for the turn ahead */
+                struct buf steal = e->text;
+                e->text = (struct buf)BUF_INIT;
+                e->cur = 0;
+                submitted = steal;
             }
+            edit_render(e);
             result = EDIT_LINE;
             leave = 1;
             break;
@@ -8037,8 +7940,7 @@ static enum edit_result edit_line(struct editor *e, char **out)
             edit_repaint(e);
             break;
         case 0x03: /* Ctrl+C: cancel line (empty line = quit) */
-            edit_frame_erase(e);
-            out_puts("^C\r\n");
+            edit_menu_clear(e);
             if (e->text.len) {
                 e->text.len = 0;
                 e->cur = 0;
@@ -8049,7 +7951,7 @@ static enum edit_result edit_line(struct editor *e, char **out)
             leave = 1;
             break;
         case 0x04: /* Ctrl+D: quit */
-            out_puts("\r\n");
+            edit_menu_clear(e);
             result = EDIT_EOF;
             leave = 1;
             break;
@@ -8120,11 +8022,29 @@ static enum edit_result edit_line(struct editor *e, char **out)
 
     edit_menu_clear(e);
     out_puts("\x1b[?2004l"); /* bracketed paste off */
+    /* leave: put the cursor back at the content end so command output
+     * and streaming grow from where the transcript left off */
+    {
+        int cr = e->content_row, cc = e->content_col;
+        if (cr > dock_scroll_bottom())
+            cr = dock_scroll_bottom();
+        if (cr < 1)
+            cr = 1;
+        if (cc < 1)
+            cc = 1;
+        out_printf("\x1b[%d;%dH", cr, cc);
+    }
+    if (result == EDIT_CANCEL)
+        out_puts("^C\r\n");
+    else if (result == EDIT_EOF)
+        out_puts("\r\n");
     term_raw_end(saved);
     if (result == EDIT_LINE) {
-        buf_reserve(&e->text, 1);
-        e->text.p[e->text.len] = '\0';
-        *out = buf_detach(&e->text);
+        buf_reserve(&submitted, 1);
+        submitted.p[submitted.len] = '\0';
+        *out = buf_detach(&submitted);
+    } else {
+        buf_free(&submitted);
     }
     return result;
 }
@@ -8440,10 +8360,9 @@ static void repl_banner(void)
 
 static int run_repl(struct config *cfg)
 {
-    /* input dock (ki's interaction mode): the composer sits at the content
-     * end with a dim status line directly beneath it; when the content
-     * reaches the bottom the status naturally pins on the last screen row.
-     * Output scrolls inside rows 1..N-1 (DECSTBM). */
+    /* input dock: the composer panel pins to the bottom edge (rules +
+     * draft window + hint + status, 4..13 rows tall) and stays visible
+     * for the whole session; output scrolls inside rows 1..N-13. */
     int dock = g_console_in && g_emit_vt;
     int dock_row = 0;
     g_dock = dock;
@@ -8451,9 +8370,7 @@ static int run_repl(struct config *cfg)
     if (dock) {
         term_size_refresh();
         dock_row = g_term_rows;
-        /* rows N-1/N stay free: during a model turn they hold the pinned
-         * composer and status line so the dialog never vanishes */
-        out_printf("\x1b[1;%dr", dock_row - 2);
+        out_printf("\x1b[1;%dr", dock_scroll_bottom());
     }
 
     repl_banner();
@@ -8480,15 +8397,12 @@ static int run_repl(struct config *cfg)
         enum edit_result er;
         if (dock) {
             term_size_refresh();
-            if (dock_row != g_term_rows)
+            if (dock_row != g_term_rows) {
                 dock_row = g_term_rows; /* re-anchor after a resize */
-            int prow = cursor_screen_row(); /* the row where content ended */
-            if (prow < 1 || prow > dock_row - 2)
-                prow = dock_row - 2;
-            out_printf("\x1b[1;%dr", dock_row - 2);
-            out_printf("\x1b[%d;1H", prow);
-            /* the composer frame owns everything down to its own model
-             * status row (drawn inside edit_render) */
+                out_printf("\x1b[1;%dr", dock_scroll_bottom());
+            }
+            /* the composer panel owns the docked bottom rows; edit_line
+             * captures the content end itself */
             er = edit_line(&ed, &line);
         } else if (g_console_in) {
             out_puts("> ");
@@ -9031,7 +8945,6 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 break; /* a partial stream must not be replayed */
             if (++attempt >= 3)
                 break;
-            dock_yield();
             if (g_emit_vt)
                 out_printf("\r\x1b[0K\x1b[2m⚠ 连接异常，正在重试（%d/2）…\x1b[0m\r\n",
                            attempt);
@@ -9087,13 +9000,11 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 }
             }
             /* ki's error row: red X, dim source tag, plain message */
-            dock_yield();
             if (g_emit_vt)
                 out_printf("\x1b[31mX\x1b[0m \x1b[2msystem:\x1b[0m %s\r\n",
                            st.error);
             else
                 out_printf("X system: %s\r\n", st.error);
-            content_note_above();
             stream_state_free(&st);
             rc = 1;
             break;
@@ -9228,7 +9139,6 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
          * and total wall time, then a blank row for the next composer */
         char fs[16];
         fmt_secs(fs, sizeof fs, (GetTickCount() - g_turn_start) / 1000);
-        dock_yield();
         if (g_emit_vt)
             out_puts("\x1b[2m");
         if (turn_has_cache && turn_in > 0)
@@ -9241,7 +9151,6 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         if (g_emit_vt)
             out_puts("\x1b[0m");
         out_puts("\r\n");
-        content_note_above();
     }
     /* auto-compact between user turns: once the request outgrows 3/4 of
      * the context window, fold the old history into a summary so the next
