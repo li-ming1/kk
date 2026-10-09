@@ -9756,12 +9756,15 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             snprintf(tps, sizeof tps, " · %lld.%d t/s", (long long)(t10 / 10),
                      (int)(t10 % 10));
         }
+        /* percent to one decimal: 1-2% hits are common on short turns and
+         * rounding them to 0% reads as "caching is broken" */
+        int64_t ch10 = turn_in > 0 ? turn_cache * 1000 / turn_in : 0;
         if (g_emit_vt)
             out_puts("\x1b[2m");
         if (turn_has_cache && turn_in > 0)
-            out_printf("[in %lld · out %lld%s · ch %d%% · %s]\r\n",
+            out_printf("[in %lld · out %lld%s · ch %lld.%d%% · %s]\r\n",
                        (long long)turn_in, (long long)turn_out, tps,
-                       (int)(turn_cache * 100 / turn_in), fs);
+                       (long long)(ch10 / 10), (int)(ch10 % 10), fs);
         else
             out_printf("[in %lld · out %lld%s · %s]\r\n", (long long)turn_in,
                        (long long)turn_out, tps, fs);
