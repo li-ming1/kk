@@ -32,6 +32,7 @@
 #define NOCRYPT
 #include <windows.h>
 #include <winhttp.h>
+#include <dbghelp.h>
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -7707,7 +7708,9 @@ static enum edit_result edit_line(struct editor *e, char **out)
     edit_repaint(e);
     /* bracketed paste: the terminal wraps pasted text in ESC[200~ ..
      * ESC[201~ so its newlines land in the draft instead of submitting */
-    out_puts("\x1b[?2004h");
+    /* mode switches, not content: never seek (a seek would yank the
+     * caret out of the draft right after the first repaint) */
+    out_frame_puts("\x1b[?2004h");
 
     enum edit_result result = EDIT_EOF;
     int leave = 0;
@@ -7980,7 +7983,7 @@ static enum edit_result edit_line(struct editor *e, char **out)
     }
 
     edit_menu_clear(e);
-    out_puts("\x1b[?2004l"); /* bracketed paste off */
+    out_frame_puts("\x1b[?2004l"); /* bracketed paste off */
     if (result == EDIT_CANCEL)
         out_puts("^C\r\n");
     else if (result == EDIT_EOF)
@@ -9244,8 +9247,40 @@ static int run_prompt(struct config *cfg, const char *prompt, int cont)
     return rc;
 }
 
+/* --- crash diagnostics: minidump on unhandled exception ------------------ */
+/* A crash mid-turn used to vanish silently; the dump (next to the exe,
+ * analyzed against kk.pdb) names the faulting function and line. */
+static LONG WINAPI kk_crash_filter(EXCEPTION_POINTERS *ep)
+{
+    HANDLE f = CreateFileA("kk_crash.dmp", GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei = { GetCurrentThreadId(), ep, 0 };
+        BOOL (WINAPI *pMiniDump)(HANDLE, HANDLE, DWORD, MINIDUMP_TYPE,
+                                 PMINIDUMP_EXCEPTION_INFORMATION,
+                                 PMINIDUMP_USER_STREAM_INFORMATION,
+                                 PMINIDUMP_CALLBACK_INFORMATION) = NULL;
+        HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+        if (dbghelp)
+            pMiniDump = (BOOL (WINAPI *)(HANDLE, HANDLE, DWORD, MINIDUMP_TYPE,
+                                         PMINIDUMP_EXCEPTION_INFORMATION,
+                                         PMINIDUMP_USER_STREAM_INFORMATION,
+                                         PMINIDUMP_CALLBACK_INFORMATION))
+                GetProcAddress(dbghelp, "MiniDumpWriteDump");
+        if (pMiniDump)
+            pMiniDump(GetCurrentProcess(), f, GetCurrentProcessId(),
+                      MiniDumpNormal, &mei, NULL, NULL);
+        CloseHandle(f);
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE),
+                  "\r\nkk crashed: dump written to kk_crash.dmp\r\n", 46,
+                  &(DWORD){0}, NULL);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int wmain(int argc, wchar_t **wargv)
 {
+    SetUnhandledExceptionFilter(kk_crash_filter);
     term_init();
     dirs_init();
 
