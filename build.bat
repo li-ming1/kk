@@ -11,4 +11,5 @@ if not exist "%VSD%" (
 call "%VSD%" -arch=x64 -no_logo
 if errorlevel 1 exit /b 1
 cl /nologo /std:c11 /W4 /O2 /GL /MT /Zi /utf-8 kk.c ^
-    /link /LTCG /OUT:kk.exe winhttp.lib user32.lib
+    /link /LTCG /OUT:kk.exe /MANIFEST:EMBED /MANIFESTINPUT:kk.manifest ^
+    winhttp.lib user32.lib
