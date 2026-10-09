@@ -1308,12 +1308,61 @@ static void out_write_unlocked(const char *s, size_t n)
     }
 }
 
+/* Content-end tracking for the agent thread: it writes the transcript
+ * while the composer (main thread) parks the cursor in the draft, so
+ * every agent write seeks to the tracked end first and re-tracks after.
+ * Kept under g_out_lock. */
+static volatile LONG g_agent_writes; /* set on the agent thread only */
+static int g_content_row, g_content_col;
+
+/* Last row of the scroll region: just above the tallest possible panel. */
+static int dock_scroll_bottom(void)
+{
+    int b = g_term_rows - 13;
+    return b > 0 ? b : 1;
+}
+
+/* Seek to the tracked content end and re-track after a write. Lock held. */
+static void content_seek_write(const char *s, size_t n)
+{
+    if (g_content_row < 1) {
+        int r = 0, c = 0;
+        cursor_abs(&r, &c);
+        g_content_row = r > 0 ? r : 1;
+        g_content_col = c > 0 ? c : 1;
+    }
+    if (g_content_row > dock_scroll_bottom())
+        g_content_row = dock_scroll_bottom();
+    char ctl[32];
+    int cn = snprintf(ctl, sizeof ctl, "\x1b[%d;%dH", g_content_row,
+                      g_content_col);
+    out_write_unlocked(ctl, (size_t)cn);
+    out_write_unlocked(s, n);
+    int r = 0, c = 0;
+    cursor_abs(&r, &c);
+    if (r > 0) {
+        g_content_row = r;
+        g_content_col = c > 0 ? c : 1;
+    }
+}
+
 static void out_write(const char *s, size_t n)
 {
     if (!n)
         return;
     AcquireSRWLockExclusive(&g_out_lock);
-    out_write_unlocked(s, n);
+    if (g_agent_writes)
+        content_seek_write(s, n);
+    else
+        out_write_unlocked(s, n);
+    ReleaseSRWLockExclusive(&g_out_lock);
+}
+
+/* Main-thread transcript write while a turn runs (same discipline). */
+static void out_content_puts(const char *s)
+{
+    AcquireSRWLockExclusive(&g_out_lock);
+    content_seek_write(s, strlen(s));
     ReleaseSRWLockExclusive(&g_out_lock);
 }
 
@@ -1322,26 +1371,37 @@ static void out_puts(const char *s)
     out_write(s, strlen(s));
 }
 
+/* out_printf scratch, one per thread (the agent thread writes the
+ * transcript while the composer paints on the main thread); freed by
+ * out_printf_thread_end so per-turn agent threads never leak it. */
+static _Thread_local struct buf g_out_scratch;
+static _Thread_local int g_out_scratch_used;
+
 static void out_printf(const char *fmt, ...)
 {
-    /* one static scratch (main-thread only: the spinner and queue
-     * reader paint through their own buffers) instead of a heap
-     * alloc/free per call — the menu and dock repaint these on every
-     * keystroke while a menu is open */
-    static struct buf b;
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
     if (n <= 0)
         return;
-    buf_reset(&b);
-    buf_reserve(&b, (size_t)n);
+    buf_reset(&g_out_scratch);
+    buf_reserve(&g_out_scratch, (size_t)n);
+    g_out_scratch_used = 1;
     va_start(ap, fmt);
-    vsnprintf(b.p, (size_t)n + 1, fmt, ap);
+    vsnprintf(g_out_scratch.p, (size_t)n + 1, fmt, ap);
     va_end(ap);
-    b.len = (size_t)n;
-    out_write(b.p, b.len);
+    g_out_scratch.len = (size_t)n;
+    out_write(g_out_scratch.p, g_out_scratch.len);
+}
+
+/* Release the calling thread's out_printf scratch (agent thread exit). */
+static void out_printf_thread_end(void)
+{
+    if (g_out_scratch_used) {
+        buf_free(&g_out_scratch);
+        g_out_scratch_used = 0;
+    }
 }
 
 /* Fixed dock (ki's interaction mode): rows 1..N-2 scroll the transcript
@@ -1403,19 +1463,14 @@ static void trunc_cols(char *dst, size_t cap, const char *src, int max_cols)
 static const char *SPIN_FRAMES[] = { "⠋", "⠙", "⠹", "⠸", "⠼",
                                      "⠴", "⠦", "⠧", "⠇", "⠏" };
 
-/* --- typing while a turn runs (interrupt with new input) ------------------ */
+/* --- input during a turn (the composer never sleeps) ---------------------- */
 
-/* While a turn runs the composer is dead — keystrokes would pile up in
- * the console buffer and dump into the editor after the turn. A reader
- * thread takes them instead: typing edits a dim staging line pinned
- * under the status rows, Enter interrupts the run right away and the
- * staged text becomes the user turn the next model request answers.
- * Esc just cancels, like pi's esc. All state below is guarded by
- * g_out_lock; anything painted under the lock goes through
- * out_write_unlocked. */
+/* The composer runs on the main thread for the whole session; a turn
+ * streams on the agent thread. Text submitted mid-turn is queued here:
+ * Enter sets g_steer + g_cancel, the run unwinds, and turn_feed_queue
+ * injects the text as the user turn the next request answers. All
+ * queued state is guarded by g_out_lock. */
 
-static char g_stage[4096];            /* staging line bytes (UTF-8) */
-static size_t g_stage_len;
 static struct buf g_queued;           /* pending new-input lines, \n separated */
 static volatile LONG g_steer;         /* enter with content: inject + interrupt */
 static char g_tick_label[160];        /* running tool for the status line */
@@ -1428,11 +1483,58 @@ static DWORD g_tick_start;            /* when the running tool started */
 static volatile LONG g_frame; /* spinner animation frame */
 static struct buf g_dock_frame;
 
-/* Last row of the scroll region: just above the tallest possible panel. */
-static int dock_scroll_bottom(void)
+/* Build the pinned status row's text: spinner + phase during waits and
+ * streaming, the running tool's label, the model name when idle. Both
+ * the spinner thread and the composer frame render through this, so a
+ * keystroke repaint never flickers the row back to the model name. */
+static void status_line_build(char *line, size_t lcap, char *tail,
+                              size_t tcap)
 {
-    int b = g_term_rows - 13;
-    return b > 0 ? b : 1;
+    int busy = (int)g_busy;
+    tail[0] = '\0';
+    if (busy == 1) {
+        if (InterlockedCompareExchange(&g_cancel, 0, 0))
+            snprintf(line, lcap,
+                     "\x1b[36m⇣\x1b[0m \x1b[36m正在取消…\x1b[0m");
+        else
+            snprintf(line, lcap,
+                     "\x1b[36m%s\x1b[0m \x1b[36m思考中\x1b[0m"
+                     "\x1b[2m · Ctrl+C 中断\x1b[0m",
+                     SPIN_FRAMES[g_frame % 10]);
+    } else if (g_tick_label[0]) {
+        char label[160];
+        trunc_cols(label, sizeof label, g_tick_label,
+                   g_term_cols - 40 > 8 ? g_term_cols - 40 : 8);
+        snprintf(line, lcap, "\x1b[36m%s\x1b[0m \x1b[2m%s\x1b[0m",
+                 SPIN_FRAMES[g_frame % 10], label);
+    } else if (busy == 2) {
+        const char *spin = SPIN_FRAMES[g_frame % 10];
+        if (g_stream_bytes) {
+            char fb[24];
+            fmt_bytes(fb, sizeof fb, g_stream_bytes);
+            snprintf(line, lcap,
+                     "\x1b[36m%s\x1b[0m \x1b[36m生成中\x1b[0m"
+                     "\x1b[2m · ↓%s\x1b[0m", spin, fb);
+        } else
+            snprintf(line, lcap,
+                     "\x1b[36m%s\x1b[0m \x1b[36m生成中\x1b[0m", spin);
+    } else {
+        char model[160];
+        trunc_cols(model, sizeof model,
+                   g_status_model ? g_status_model : "(未设置)",
+                   g_term_cols - 20 > 8 ? g_term_cols - 20 : 8);
+        if (g_ctx_tokens > 0)
+            snprintf(line, lcap, "\x1b[2m%s · ~%lluk ctx\x1b[0m", model,
+                     (unsigned long long)(g_ctx_tokens / 1000));
+        else
+            snprintf(line, lcap, "\x1b[2m%s\x1b[0m", model);
+    }
+    if (busy) {
+        char fs[16];
+        DWORD since = g_tick_label[0] ? g_tick_start : g_turn_start;
+        fmt_secs(fs, sizeof fs, (GetTickCount() - since) / 1000);
+        snprintf(tail, tcap, "\x1b[2m · %s\x1b[0m", fs);
+    }
 }
 
 /* The status line: spinner + phase during waits, live counters while
@@ -1445,52 +1547,8 @@ static void status_repaint(void)
     int cr = 0, cc = 0;
     cursor_abs(&cr, &cc);
     int row = g_term_rows; /* the panel's status row: last on screen */
-    char line[512];
-    int busy = (int)g_busy;
-    if (busy == 1) {
-        if (InterlockedCompareExchange(&g_cancel, 0, 0))
-            snprintf(line, sizeof line,
-                     "\x1b[36m⇣\x1b[0m \x1b[36m正在取消…\x1b[0m");
-        else
-            snprintf(line, sizeof line,
-                     "\x1b[36m%s\x1b[0m \x1b[36m思考中\x1b[0m"
-                     "\x1b[2m · Ctrl+C 中断\x1b[0m",
-                     SPIN_FRAMES[g_frame % 10]);
-    } else if (g_tick_label[0]) {
-        char label[160];
-        trunc_cols(label, sizeof label, g_tick_label,
-                   g_term_cols - 40 > 8 ? g_term_cols - 40 : 8);
-        snprintf(line, sizeof line, "\x1b[36m%s\x1b[0m \x1b[2m%s\x1b[0m",
-                 SPIN_FRAMES[g_frame % 10], label);
-    } else if (busy == 2) {
-        const char *spin = SPIN_FRAMES[g_frame % 10];
-        if (g_stream_bytes) {
-            char fb[24];
-            fmt_bytes(fb, sizeof fb, g_stream_bytes);
-            snprintf(line, sizeof line,
-                     "\x1b[36m%s\x1b[0m \x1b[36m生成中\x1b[0m"
-                     "\x1b[2m · ↓%s\x1b[0m", spin, fb);
-        } else
-            snprintf(line, sizeof line,
-                     "\x1b[36m%s\x1b[0m \x1b[36m生成中\x1b[0m", spin);
-    } else {
-        char model[160];
-        trunc_cols(model, sizeof model,
-                   g_status_model ? g_status_model : "(未设置)",
-                   g_term_cols - 20 > 8 ? g_term_cols - 20 : 8);
-        if (g_ctx_tokens > 0)
-            snprintf(line, sizeof line, "\x1b[2m%s · ~%lluk ctx\x1b[0m", model,
-                     (unsigned long long)(g_ctx_tokens / 1000));
-        else
-            snprintf(line, sizeof line, "\x1b[2m%s\x1b[0m", model);
-    }
-    char tail[96] = "";
-    if (busy) {
-        char fs[16];
-        DWORD since = g_tick_label[0] ? g_tick_start : g_turn_start;
-        fmt_secs(fs, sizeof fs, (GetTickCount() - since) / 1000);
-        snprintf(tail, sizeof tail, "\x1b[2m · %s\x1b[0m", fs);
-    }
+    char line[512], tail[96];
+    status_line_build(line, sizeof line, tail, sizeof tail);
     buf_reset(&g_dock_frame);
     buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K%s%s\x1b[0K", row, line,
                 tail);
@@ -1499,59 +1557,6 @@ static void status_repaint(void)
     if (g_dock_frame.len)
         out_write_unlocked(g_dock_frame.p, g_dock_frame.len);
     ReleaseSRWLockExclusive(&g_out_lock);
-}
-
-/* The staged interrupt text: during a turn it shows in the docked
- * panel's draft row — the composer's stand-in while output streams. */
-static void staging_paint(void)
-{
-    if (!g_emit_vt || !g_dock)
-        return;
-    AcquireSRWLockExclusive(&g_out_lock);
-    int cr = 0, cc = 0;
-    cursor_abs(&cr, &cc);
-    int row = g_term_rows - 2; /* the panel's single draft row */
-    buf_reset(&g_dock_frame);
-    if (g_stage_len) {
-        char show[1600];
-        trunc_cols(show, sizeof show, g_stage, g_term_cols - 6);
-        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K\x1b[1m▌\x1b[0m %s_",
-                    row, show);
-    } else {
-        /* nothing staged: leave the draft row empty */
-        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K", row);
-    }
-    if (cr)
-        buf_appendf(&g_dock_frame, "\x1b[%d;%dH", cr, cc);
-    if (g_dock_frame.len)
-        out_write_unlocked(g_dock_frame.p, g_dock_frame.len);
-    ReleaseSRWLockExclusive(&g_out_lock);
-}
-
-/* Repaint the dock's busy rows: during a turn the staged text and the
- * status line live in the docked panel's draft and status rows. */
-static void dock_repaint(void)
-{
-    if (!g_dock)
-        return;
-    if ((int)g_busy != 0) {
-        staging_paint();
-        status_repaint();
-    } else {
-        /* idle: clear the staged text left by the turn, then put the
-         * model line back onto the status row */
-        AcquireSRWLockExclusive(&g_out_lock);
-        int cr = 0, cc = 0;
-        cursor_abs(&cr, &cc);
-        buf_reset(&g_dock_frame);
-        buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K", g_term_rows - 2);
-        if (cr)
-            buf_appendf(&g_dock_frame, "\x1b[%d;%dH", cr, cc);
-        if (g_dock_frame.len)
-            out_write_unlocked(g_dock_frame.p, g_dock_frame.len);
-        ReleaseSRWLockExclusive(&g_out_lock);
-        status_repaint();
-    }
 }
 
 /* pi's user-message echo: the text wraps at the terminal width and every
@@ -1598,7 +1603,8 @@ static void user_bars_buf(struct buf *out, const char *text, size_t len)
 }
 
 /* Echo a pending line as the user turn it becomes (same shape the
- * composer draws). Main thread, no lock held. */
+ * composer draws). Runs on whichever thread feeds the conversation;
+ * out_write seeks to the content end on the agent thread. */
 static void user_line_show(const char *text)
 {
     if (g_emit_vt) {
@@ -1610,120 +1616,6 @@ static void user_line_show(const char *text)
     } else {
         out_printf("> %s\r\n", text);
     }
-}
-
-/* Runs while a turn is live: turns keystrokes into the staging line.
- * Exits within one poll of g_busy==0. */
-
-/* Hand the staged line over as the next request's content
- * (g_out_lock held). */
-static void stage_enqueue(void)
-{
-    if (g_stage_len) {
-        buf_append_n(&g_queued, g_stage, g_stage_len);
-        buf_appendc(&g_queued, '\n');
-        g_stage_len = 0;
-        g_stage[0] = '\0';
-    }
-}
-
-static DWORD WINAPI queue_reader_thread(LPVOID arg)
-{
-    (void)arg;
-    /* raw VT bytes like the composer: the terminal's sequences arrive
-     * whole, so arrow keys (ESC [ ...) can be drained instead of
-     * cancelling the turn the way a lone ESC does */
-    DWORD saved;
-    if (!term_raw_begin(&saved))
-        return 0;
-    int in_paste = 0, swallow_lf = 0;
-    while (g_emit_vt && g_console_in && (int)g_busy != 0) {
-        if (!term_wait_readable(15))
-            continue;
-        unsigned char buf[64];
-        DWORD got = 0;
-        if (!ReadFile(g_hstdin, buf, sizeof buf, &got, NULL))
-            break;
-        if (got == 0)
-            continue; /* Ctrl+Z EOF mark: ignore */
-        for (DWORD i = 0; i < got && (int)g_busy != 0; i++) {
-            unsigned char b = buf[i];
-            if (b == 0x1B) {
-                unsigned char s;
-                if (term_read_byte_timeout(&s, 50) <= 0) {
-                    /* lone esc: plain cancel */
-                    if (!in_paste)
-                        InterlockedExchange(&g_cancel, 1);
-                } else if (s == '[' || s == 'O') {
-                    /* a terminal sequence (arrows, paste markers):
-                     * drain it — arrow keys never steer or cancel;
-                     * 200~/201~ toggle the paste fold */
-                    char params[16];
-                    size_t np;
-                    unsigned char final = csi_read(params, sizeof params, &np);
-                    if (final == '~' && np == 3 && params[0] == '2'
-                        && params[1] == '0')
-                        in_paste = params[2] == '0';
-                    swallow_lf = 0;
-                }
-                continue;
-            }
-            AcquireSRWLockExclusive(&g_out_lock);
-            if (b == 0x08 || b == 0x7F) {
-                /* backspace: drop one UTF-8 character */
-                swallow_lf = 0;
-                while (g_stage_len > 0
-                       && (g_stage[g_stage_len - 1] & 0xC0) == 0x80)
-                    g_stage_len--;
-                if (g_stage_len > 0)
-                    g_stage_len--;
-                g_stage[g_stage_len] = '\0';
-            } else if (b == '\r' || b == '\n') {
-                /* enter with content: interrupt the run now and let the
-                 * staged text drive the next request; a newline inside a
-                 * paste folds into the staged text instead */
-                int crlf = b == '\n' && swallow_lf;
-                swallow_lf = b == '\r';
-                if (in_paste) {
-                    if (!crlf && g_stage_len < sizeof g_stage - 1) {
-                        g_stage[g_stage_len++] = '\n';
-                        g_stage[g_stage_len] = '\0';
-                    }
-                } else if (!crlf) {
-                    stage_enqueue();
-                    if (g_queued.len) {
-                        InterlockedExchange(&g_steer, 1);
-                        InterlockedExchange(&g_cancel, 1);
-                    }
-                }
-            } else if (b >= 0x20 && b != 0x7F) {
-                /* raw UTF-8 bytes append directly: multi-byte chars
-                 * assemble themselves in the staging line */
-                swallow_lf = 0;
-                if (g_stage_len < sizeof g_stage - 1) {
-                    g_stage[g_stage_len++] = (char)b;
-                    g_stage[g_stage_len] = '\0';
-                }
-            }
-            ReleaseSRWLockExclusive(&g_out_lock);
-        }
-        /* one repaint per batch, not per byte: dock_repaint costs two
-         * cursor_abs round-trips plus the staging-line width rescan */
-        dock_repaint(); /* self-locking; safe from this thread */
-    }
-    term_raw_end(saved);
-    return 0;
-}
-
-/* Turn end: drop the staged half-line (the composer the editor draws
- * next starts fresh) and repaint the dock idle. */
-static void dock_unpin(void)
-{
-    AcquireSRWLockExclusive(&g_out_lock);
-    g_stage_len = 0;
-    g_stage[0] = '\0';
-    ReleaseSRWLockExclusive(&g_out_lock);
-    dock_repaint();
 }
 
 /* Wait spinner: the sole animator of the pinned status line, running
@@ -1739,7 +1631,7 @@ static DWORD WINAPI spinner_thread(LPVOID arg)
         if (busy == 0 || !g_emit_vt)
             return 0;
         InterlockedIncrement(&g_frame);
-        dock_repaint(); /* status line AND the staging bar */
+        status_repaint();
         Sleep(90);
     }
 }
@@ -2259,7 +2151,7 @@ static void painter_screen(struct painter *p)
     }
     p->row_shown = 1;
     if (g_dock && g_busy)
-        dock_repaint(); /* keep the staged text and status fresh */
+        status_repaint(); /* keep the status row fresh */
 }
 
 /* Commit the pending row: sync the screen and end the line. The row
@@ -7488,6 +7380,12 @@ static void edit_menu_draw(struct editor *e)
 {
     if (!g_emit_vt)
         return;
+    if ((int)g_busy != 0) {
+        /* the menu captures transcript rows a live turn scrolls under
+         * it — restore would paste stale pixels over new content */
+        e->menu_count = 0;
+        return;
+    }
     int match[KK_N_COMMANDS];
     int count = 0;
     if (edit_menu_candidate(e)) {
@@ -7719,28 +7617,6 @@ static enum edit_result edit_read_cooked(char **out)
     return *out ? EDIT_LINE : EDIT_EOF;
 }
 
-/* Submit echo: pi-style cyan bars of the draft print at the content end
- * (captured at edit start) — the transcript shows exactly the message
- * the model sees, and the docked panel repaints empty beneath it. Main
- * thread. */
-static void edit_submit_echo(struct editor *e)
-{
-    static struct buf b; /* editor runs on the main thread only */
-    buf_reset(&b);
-    buf_appendf(&b, "\x1b[%d;%dH", e->content_row, e->content_col);
-    user_bars_buf(&b, e->text.p, e->text.len);
-    buf_appends(&b, "\r\n");
-    out_write(b.p, b.len);
-    /* the bars are transcript now: re-anchor so the post-edit cursor
-     * (and the following output) appends after them, not over them */
-    int cr = 0, cc = 0;
-    cursor_abs(&cr, &cc);
-    if (cr > 0) {
-        e->content_row = cr;
-        e->content_col = cc > 0 ? cc : 1;
-    }
-}
-
 static enum edit_result edit_line(struct editor *e, char **out)
 {
     if (!g_emit_vt)
@@ -7938,11 +7814,10 @@ static enum edit_result edit_line(struct editor *e, char **out)
                 edit_render(e); /* echo the completed line */
             }
             edit_menu_clear(e);
-            if (e->text.len && e->text.p[0] != '/')
-                edit_submit_echo(e); /* cyan bars at the content end */
             {
                 /* the draft moves to the transcript; the docked panel
-                 * stays up, empty, for the turn ahead */
+                 * stays up, empty. turn_feed_queue echoes it as the cyan
+                 * bars once the turn picks it up (idle start or steer). */
                 struct buf steal = e->text;
                 e->text = (struct buf)BUF_INIT;
                 e->cur = 0;
@@ -7959,7 +7834,12 @@ static enum edit_result edit_line(struct editor *e, char **out)
             }
             edit_repaint(e);
             break;
-        case 0x03: /* Ctrl+C: cancel line (empty line = quit) */
+        case 0x03: /* Ctrl+C: empty draft cancels the running turn (idle:
+                      cancel line, empty = quit) */
+            if ((int)g_busy != 0 && e->text.len == 0) {
+                InterlockedExchange(&g_cancel, 1);
+                break;
+            }
             edit_menu_clear(e);
             if (e->text.len) {
                 e->text.len = 0;
@@ -8378,6 +8258,36 @@ static void repl_banner(void)
                    KK_VERSION);
 }
 
+/* Agent turn thread: one live turn at a time, while the composer keeps
+ * the main thread for the whole session. */
+struct agent_args {
+    struct config *cfg;
+    struct conversation *cv;
+    struct session_log *slog;
+    const char *sysp;
+};
+static HANDLE g_agent_thread;
+
+static DWORD WINAPI agent_thread_proc(LPVOID arg)
+{
+    struct agent_args *a = arg;
+    InterlockedExchange(&g_agent_writes, 1);
+    agent_loop(a->cfg, a->cv, a->slog, a->sysp, 1);
+    InterlockedExchange(&g_agent_writes, 0);
+    out_printf_thread_end();
+    free(a);
+    return 0;
+}
+
+/* Queue one line as pending user input (turn start or mid-turn steer). */
+static void queue_user_line(const char *line)
+{
+    AcquireSRWLockExclusive(&g_out_lock);
+    buf_append_n(&g_queued, line, strlen(line));
+    buf_appendc(&g_queued, '\n');
+    ReleaseSRWLockExclusive(&g_out_lock);
+}
+
 static int run_repl(struct config *cfg)
 {
     /* input dock: the composer panel pins to the bottom edge (rules +
@@ -8441,6 +8351,16 @@ static int run_repl(struct config *cfg)
         }
 
         if (er == EDIT_EOF) {
+            if ((int)g_busy != 0) {
+                /* quit mid-turn: plain cancel, then wait for the agent */
+                InterlockedExchange(&g_steer, 0);
+                InterlockedExchange(&g_cancel, 1);
+                if (g_agent_thread) {
+                    WaitForSingleObject(g_agent_thread, INFINITE);
+                    CloseHandle(g_agent_thread);
+                    g_agent_thread = NULL;
+                }
+            }
             out_puts("bye\r\n");
             break;
         }
@@ -8451,35 +8371,60 @@ static int run_repl(struct config *cfg)
             continue;
         }
 
-        /* the submitted line is already on screen at the edit row and the
-         * cursor sits just below it: the answer streams right there, and
-         * commits at the region bottom scroll the transcript naturally */
-
         /* history (skip commands) */
         if (line[0] != '/') {
             char *copy = xstrdup(line);
             DA_PUSH(ed.history, copy);
         }
 
-        if (line[0] == '/') {
+        if ((int)g_busy != 0) {
+            /* mid-turn: text steers — it interrupts the run and drives
+             * the next request; slash commands wait (they touch session
+             * state the turn owns) */
+            if (line[0] == '/') {
+                out_content_puts(
+                    "\x1b[2m回合进行中：命令请先 Ctrl+C 打断再执行\x1b[0m\r\n");
+            } else {
+                queue_user_line(line);
+                InterlockedExchange(&g_steer, 1);
+                InterlockedExchange(&g_cancel, 1);
+            }
+        } else if (line[0] == '/') {
             cmd_slash(cfg, line, &cv, &slog);
-            free(line);
-            continue;
-        }
-
-        if (!cfg->model || !*cfg->model) {
+        } else if (!cfg->model || !*cfg->model) {
             out_printf("未设置模型：请设置 KK_MODEL 或在 %s\\config 里配置\r\n",
                        g_appdata_dir);
-            free(line);
-            continue;
+        } else if (dock) {
+            /* start a turn on the agent thread: the text feeds through
+             * g_queued (turn_feed_queue echoes it as the cyan bars) and
+             * the composer keeps running right here */
+            queue_user_line(line);
+            cursor_abs(&g_content_row, &g_content_col);
+            if (g_content_col < 1)
+                g_content_col = 1;
+            if (g_agent_thread)
+                CloseHandle(g_agent_thread); /* previous turn, reaped */
+            struct agent_args *aa = xmalloc(sizeof *aa);
+            aa->cfg = cfg;
+            aa->cv = &cv;
+            aa->slog = &slog;
+            aa->sysp = sysp;
+            g_agent_thread = CreateThread(NULL, 0, agent_thread_proc, aa, 0,
+                                          NULL);
+            if (!g_agent_thread) {
+                /* no thread available: run the turn synchronously, the
+                 * queued text still feeds through turn_feed_queue */
+                free(aa);
+                agent_loop(cfg, &cv, &slog, sysp, 1);
+            }
+        } else {
+            /* non-dock console: synchronous turn */
+            struct message *um = conv_add(&cv, "user", line);
+            attach_user_images(um, line);
+            session_log_message(&slog, um);
+            agent_loop(cfg, &cv, &slog, sysp, 1);
         }
-
-        struct message *um = conv_add(&cv, "user", line);
-        attach_user_images(um, line);
         free(line);
-        session_log_message(&slog, um);
-
-        agent_loop(cfg, &cv, &slog, sysp, 1);
     }
 
     free(sysp);
@@ -8893,7 +8838,7 @@ static void turn_feed_queue(struct conversation *cv, struct session_log *slog)
         s += n + (nl ? 1 : 0);
     }
     free(take);
-    dock_repaint();
+    status_repaint();
 }
 
 static int queue_pending(void)
@@ -8925,11 +8870,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     g_turn_start = GetTickCount();
     g_stream_bytes = 0;
     if (g_dock)
-        dock_repaint(); /* input bar + status right under the prompt */
+        status_repaint(); /* busy status right under the prompt */
     HANDLE spinner = CreateThread(NULL, 0, spinner_thread, NULL, 0, NULL);
-    HANDLE reader = NULL;
-    if (g_dock && g_console_in && g_emit_vt)
-        reader = CreateThread(NULL, 0, queue_reader_thread, NULL, 0, NULL);
     /* no round cap, like pi: the loop runs until the model stops calling
      * tools; Ctrl+C is the escape hatch */
     for (;;) {
@@ -8945,7 +8887,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         /* race safety: input that landed as the last round ended (too
          * late to interrupt) joins this request without interrupting */
         turn_feed_queue(cv, slog);
-        dock_repaint();
+        status_repaint();
         InterlockedExchange(&g_busy, 1);
         /* request with exponential backoff: up to 3 attempts for transient
          * transport/HTTP failures, but never replay a partial stream */
@@ -9123,7 +9065,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 tool_show_exit(output);
                 tool_show_output(output);
             }
-            dock_repaint(); /* tool output consumed the dock rows */
+            status_repaint(); /* refresh the status row after tool output */
 
             struct message *tm = conv_add_take(cv, "tool", output);
             tm->tool_call_id = xstrdup(m->calls[i].id);
@@ -9187,13 +9129,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         WaitForSingleObject(spinner, 3000);
         CloseHandle(spinner);
     }
-    if (reader) {
-        WaitForSingleObject(reader, 3000);
-        CloseHandle(reader);
-    }
     InterlockedExchange(&g_steer, 0); /* a steer aimed at an already-dead run */
-    if (g_dock)
-        dock_unpin(); /* take the trailing composer and status rows down */
+    status_repaint(); /* the model name returns to the status row */
     if (g_emit_vt)
         out_puts("\x1b[?25h");
     return rc;
