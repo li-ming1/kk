@@ -4579,10 +4579,16 @@ static void fff_load(void)
  * instance. */
 static int fff_ensure(void)
 {
-    fff_load();
-    if (!fff_ok)
-        return 0;
+    /* fff_load marks fff_tried before it does any work and only sets fff_ok
+     * at the end, so calling it outside the lock let a second thread see
+     * "tried but not ok" and give up on the index entirely. It is reachable
+     * now that the main thread also warms fff, not just the startup thread. */
     AcquireSRWLockExclusive(&fff_lock);
+    fff_load();
+    if (!fff_ok) {
+        ReleaseSRWLockExclusive(&fff_lock);
+        return 0;
+    }
     if (!fff_inst) {
         /* frecency + query history DBs persist under %LOCALAPPDATA%\kk\fff:
          * ranking learns which files this workspace keeps touching, and
