@@ -6257,9 +6257,33 @@ struct session_log {
     char *path;
 };
 
+/* Open the log on its first record. A launch that never sends a message
+ * then leaves no 0-byte session behind, and `current` keeps naming the
+ * newest session that actually has content for --continue. */
+static void session_touch(struct session_log *sl)
+{
+    if (sl->file || !sl->path)
+        return;
+    HANDLE f = CreateFileA(sl->path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE)
+        return;
+    sl->file = f;
+    char *cur = xasprintf("%s\\current", g_localapp_dir);
+    HANDLE cf = CreateFileA(cur, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+    if (cf != INVALID_HANDLE_VALUE) {
+        DWORD wrote = 0;
+        WriteFile(cf, sl->path, (DWORD)strlen(sl->path), &wrote, NULL);
+        CloseHandle(cf);
+    }
+    free(cur);
+}
+
 static void session_write_line(struct session_log *sl, const char *data,
                                size_t len)
 {
+    session_touch(sl);
     if (!sl->file)
         return;
     /* the newline rides in the caller's buffer: one WriteFile per line.
@@ -6272,7 +6296,7 @@ static void session_write_line(struct session_log *sl, const char *data,
 static void session_log_message(struct session_log *sl,
                                 const struct message *m)
 {
-    if (!sl->file)
+    if (!sl->path)
         return;
     struct buf b = BUF_INIT;
     msg_serialize(&b, m, 0);
@@ -6284,7 +6308,7 @@ static void session_log_message(struct session_log *sl,
 static void session_log_usage(struct session_log *sl, int64_t prompt,
                               int64_t completion)
 {
-    if (!sl->file)
+    if (!sl->path)
         return;
     char line[128];
     int n = snprintf(line, sizeof line,
@@ -6302,7 +6326,7 @@ static void session_log_usage(struct session_log *sl, int64_t prompt,
 static void session_log_compact(struct session_log *sl, size_t keep,
                                 const char *summary)
 {
-    if (!sl->file)
+    if (!sl->path)
         return;
     struct buf b = BUF_INIT;
     buf_appendf(&b, "{\"type\":\"compact\",\"keep\":%zu,\"summary\":\"",
@@ -6436,10 +6460,16 @@ static void session_open(struct session_log *sl, int cont,
             while (plen > 0 && (prev[plen - 1] == '\n' || prev[plen - 1] == '\r'))
                 prev[--plen] = '\0';
             if (session_load(prev, cv) == 0) {
-                sl->path = xstrdup(prev);
-                sl->file = CreateFileA(prev, FILE_APPEND_DATA,
-                                       FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                HANDLE f = CreateFileA(prev, FILE_APPEND_DATA, FILE_SHARE_READ,
+                                       NULL, OPEN_EXISTING,
                                        FILE_ATTRIBUTE_NORMAL, NULL);
+                /* CreateFileA fails with INVALID_HANDLE_VALUE, which is
+                 * truthy: keeping it would pass the sl->file test below
+                 * and drop every record of the run silently */
+                if (f != INVALID_HANDLE_VALUE) {
+                    sl->file = f;
+                    sl->path = xstrdup(prev);
+                }
             }
             free(prev);
         }
@@ -6453,19 +6483,11 @@ static void session_open(struct session_log *sl, int cont,
 
     SYSTEMTIME t;
     GetLocalTime(&t);
+    /* just the path: session_touch() creates the file, and moves the
+     * --continue pointer, on the first record actually written */
     sl->path = xasprintf("%s\\%04d%02d%02d-%02d%02d%02d-%lu.jsonl", dir,
                          t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
                          t.wSecond, GetCurrentProcessId());
-    sl->file = CreateFileA(sl->path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    /* remember the latest session for --continue */
-    HANDLE cf = CreateFileA(cur, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, NULL);
-    if (cf != INVALID_HANDLE_VALUE) {
-        DWORD wrote = 0;
-        WriteFile(cf, sl->path, (DWORD)strlen(sl->path), &wrote, NULL);
-        CloseHandle(cf);
-    }
     free(cur);
     free(dir);
 }
@@ -6679,6 +6701,8 @@ static int session_switch(struct session_log *slog, struct conversation *cv,
     slog->path = xstrdup(path);
     slog->file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (slog->file == INVALID_HANDLE_VALUE)
+        slog->file = NULL; /* session_touch retries the open per record */
     /* make --continue follow the resumed session */
     char *cur = xasprintf("%s\\current", g_localapp_dir);
     HANDLE cf = CreateFileA(cur, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
@@ -9287,8 +9311,6 @@ static int run_prompt(struct config *cfg, const char *prompt, int cont)
     conv_init(&cv);
     struct session_log slog;
     session_open(&slog, cont, &cv);
-    if (!slog.file)
-        out_puts("(会话记录不可用)\r\n");
 
     if (prompt) {
         struct message *um = conv_add(&cv, "user", prompt);
