@@ -6369,15 +6369,24 @@ static void session_log_message(struct session_log *sl,
     buf_free(&b);
 }
 
+/* One record per API ROUND, not per user turn: the on-screen `ch` sums the
+ * whole turn, so it cannot tell a cold first round from an unstable prefix.
+ * cache_tokens is omitted when the endpoint reports none, which keeps the
+ * line byte-identical to the old format for those providers. */
 static void session_log_usage(struct session_log *sl, int64_t prompt,
-                              int64_t completion)
+                              int64_t completion, int64_t cache,
+                              int has_cache)
 {
     if (!sl->path)
         return;
+    char cf[32];
+    cf[0] = '\0';
+    if (has_cache)
+        snprintf(cf, sizeof cf, ",\"cache_tokens\":%lld", (long long)cache);
     char line[128];
     int n = snprintf(line, sizeof line,
-                     "{\"type\":\"usage\",\"prompt_tokens\":%lld,\"completion_tokens\":%lld}",
-                     (long long)prompt, (long long)completion);
+                     "{\"type\":\"usage\",\"prompt_tokens\":%lld,\"completion_tokens\":%lld%s}",
+                     (long long)prompt, (long long)completion, cf);
     if (n > 0 && n < (int)sizeof line - 1) {
         line[n++] = '\n';
         session_write_line(sl, line, (size_t)n);
@@ -9192,7 +9201,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 turn_cache += st.cache_tokens;
                 turn_has_cache = 1;
             }
-            session_log_usage(slog, st.prompt_tokens, st.completion_tokens);
+            session_log_usage(slog, st.prompt_tokens, st.completion_tokens,
+                              st.cache_tokens, st.has_cache);
         }
         if (st.finish != FINISH_TOOL_CALLS || st.n_calls == 0) {
             if (st.content.len) {
