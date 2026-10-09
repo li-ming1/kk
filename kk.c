@@ -6479,50 +6479,59 @@ static void session_close(struct session_log *sl)
 }
 
 /* Newest .jsonl sessions in the sessions dir, by last-write time.
- * Returns the count written into paths (at most cap). */
-static int session_list(char paths[][MAX_PATH], int cap)
+ * 0-byte logs are skipped: an aborted run leaves nothing to resume.
+ * Returns the count written into paths (at most cap); *total, when
+ * given, receives the number of resumable sessions on disk. */
+static int session_list(char paths[][MAX_PATH], int cap, int *total)
 {
     struct sess_ent {
         FILETIME ft;
         char name[MAX_PATH];
     };
-    static struct sess_ent ents[64]; /* ~17KB: too chunky for the stack */
+    DA(struct sess_ent) ents = {0};
     char dir[MAX_PATH];
     snprintf(dir, sizeof dir, "%s\\sessions\\*.jsonl", g_localapp_dir);
     WIN32_FIND_DATAA fd;
     HANDLE find = FindFirstFileA(dir, &fd);
-    if (find == INVALID_HANDLE_VALUE)
+    if (find == INVALID_HANDLE_VALUE) {
+        if (total)
+            *total = 0;
         return 0;
-    int n = 0;
+    }
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             continue;
-        if (n >= 64)
-            break;
-        ents[n].ft = fd.ftLastWriteTime;
+        if (!fd.nFileSizeLow && !fd.nFileSizeHigh)
+            continue;
+        struct sess_ent e;
+        e.ft = fd.ftLastWriteTime;
         size_t nl = strlen(fd.cFileName);
         if (nl >= MAX_PATH)
             nl = MAX_PATH - 1;
-        memcpy(ents[n].name, fd.cFileName, nl);
-        ents[n].name[nl] = '\0';
-        n++;
+        memcpy(e.name, fd.cFileName, nl);
+        e.name[nl] = '\0';
+        DA_PUSH(ents, e);
     } while (FindNextFileA(find, &fd));
     FindClose(find);
+    int n = (int)ents.n;
+    if (total)
+        *total = n;
     /* insertion sort, newest first */
     for (int i = 1; i < n; i++) {
-        struct sess_ent e = ents[i];
+        struct sess_ent e = ents.p[i];
         int j = i - 1;
-        while (j >= 0 && CompareFileTime(&ents[j].ft, &e.ft) < 0) {
-            ents[j + 1] = ents[j];
+        while (j >= 0 && CompareFileTime(&ents.p[j].ft, &e.ft) < 0) {
+            ents.p[j + 1] = ents.p[j];
             j--;
         }
-        ents[j + 1] = e;
+        ents.p[j + 1] = e;
     }
     if (n > cap)
         n = cap;
     for (int i = 0; i < n; i++)
         snprintf(paths[i], MAX_PATH, "%s\\sessions\\%s", g_localapp_dir,
-                 ents[i].name);
+                 ents.p[i].name);
+    DA_FREE(ents);
     return n;
 }
 
@@ -8046,10 +8055,13 @@ static enum edit_result edit_line(struct editor *e, char **out)
 /* One picker frame: header, rule, the sliding window of rows, rule,
  * key hints — drawn row-wise over the alt screen (cleared once on
  * entry, not per frame). */
-static void sess_pick_draw(struct sess_row *rows, int n, int from, int sel,
-                           int list_rows)
+static void sess_pick_draw(struct sess_row *rows, int n, int all, int from,
+                           int sel, int list_rows)
 {
-    out_printf("\x1b[1;1H\x1b[2K\x1b[1mSessions\x1b[0m \x1b[2m%d\x1b[0m", n);
+    out_printf("\x1b[1;1H\x1b[2K\x1b[1mSessions\x1b[0m \x1b[2m%d", n);
+    if (all > n)
+        out_printf("/%d", all); /* older ones exist but are not listed */
+    out_puts("\x1b[0m");
     ui_rule(2);
     for (int i = 0; i < list_rows; i++) {
         int r = from + i;
@@ -8081,6 +8093,20 @@ static void sess_pick_draw(struct sess_row *rows, int n, int from, int sel,
                g_term_rows);
 }
 
+/* Keep the sliding window covering the selection: after a navigation key
+ * moved it, or a resize changed how many rows fit. */
+static void sess_pick_follow(int sel, int *from, int list_rows, int total)
+{
+    if (sel < *from)
+        *from = sel;
+    if (sel >= *from + list_rows)
+        *from = sel - list_rows + 1;
+    if (*from > total - list_rows)
+        *from = total - list_rows;
+    if (*from < 0)
+        *from = 0;
+}
+
 /* Full-screen /resume picker: recent sessions in the alternate screen,
  * arrows move with wrap, enter resumes, esc cancels. Returns 1 and
  * fills path on a pick, 0 on cancel, -1 when there is nothing to list. */
@@ -8088,7 +8114,8 @@ static int session_pick(char *path, size_t cap)
 {
     struct sess_row *rows = xmalloc(sizeof(struct sess_row) * 64);
     char (*paths)[MAX_PATH] = xmalloc(sizeof(*paths) * 64);
-    int total = session_list(paths, 64);
+    int all = 0;
+    int total = session_list(paths, 64, &all);
     if (!total) {
         free(paths);
         free(rows);
@@ -8123,7 +8150,7 @@ static int session_pick(char *path, size_t cap)
     /* raw VT bytes like the composer: arrows arrive as ESC [ A/B … */
     while (!leave) {
         if (dirty) {
-            sess_pick_draw(rows, total, from, sel, list_rows);
+            sess_pick_draw(rows, total, all, from, sel, list_rows);
             dirty = 0;
         }
         unsigned char b;
@@ -8137,6 +8164,7 @@ static int session_pick(char *path, size_t cap)
                 lr = 1;
             if (lr != list_rows) {
                 list_rows = lr;
+                sess_pick_follow(sel, &from, list_rows, total);
                 out_puts("\x1b[2J\x1b[H"); /* relayout: wipe stale rows */
                 dirty = 1;
             }
@@ -8174,6 +8202,7 @@ static int session_pick(char *path, size_t cap)
                                                   : total - 1;
                 else
                     continue;
+                sess_pick_follow(sel, &from, list_rows, total);
                 dirty = 1; /* a navigation key moved the selection */
             }
             /* meta chords and other escapes: ignored */
@@ -8185,15 +8214,6 @@ static int session_pick(char *path, size_t cap)
         } else if (b == 'q' || b == 0x03) {
             leave = 1; /* q / Ctrl+C cancel */
         }
-        /* the sliding window follows the (wrapping) selection */
-        if (sel < from)
-            from = sel;
-        if (sel >= from + list_rows)
-            from = sel - list_rows + 1;
-        if (from > total - list_rows)
-            from = total - list_rows;
-        if (from < 0)
-            from = 0;
     }
     out_puts("\x1b[?25h\x1b[?1049l");
     g_no_seek = 0;
@@ -8299,7 +8319,7 @@ static int cmd_slash(struct config *cfg, const char *line,
         if (!*arg) {
             /* scripted stdin: plain numbered list */
             char (*paths)[MAX_PATH] = xmalloc(sizeof(*paths) * 64);
-            int n = session_list(paths, 64);
+            int n = session_list(paths, 64, NULL);
             out_printf("最近的会话（%d）\r\n", n);
             for (int i = 0; i < n; i++) {
                 const char *base = strrchr(paths[i], '\\');
@@ -8314,7 +8334,7 @@ static int cmd_slash(struct config *cfg, const char *line,
         }
         int pick = atoi(arg);
         char (*paths)[MAX_PATH] = xmalloc(sizeof(*paths) * 64);
-        int n = session_list(paths, 64);
+        int n = session_list(paths, 64, NULL);
         if (pick < 1 || pick > n) {
             out_printf("无效的会话编号（1-%d）\r\n", n);
             free(paths);
