@@ -1837,7 +1837,9 @@ static int http_post_stream(const char *url, const char *auth_key,
     whost = w_from_utf8(host);
     wpath = w_from_utf8(path);
     if (!whost || !wpath) {
-        *body_out = xstrdup("out of memory");
+        /* xmalloc fatals on real exhaustion, so NULL here only ever means
+         * the bytes were not valid UTF-8 */
+        *body_out = xstrdup("base_url is not valid UTF-8");
         goto out;
     }
 
@@ -1849,7 +1851,7 @@ static int http_post_stream(const char *url, const char *auth_key,
         whdrs = w_from_utf8(hdrs.p);
         buf_free(&hdrs);
         if (!whdrs) {
-            *body_out = xstrdup("out of memory");
+            *body_out = xstrdup("api_key is not valid UTF-8");
             goto out;
         }
     }
@@ -1936,6 +1938,9 @@ static int http_post_stream(const char *url, const char *auth_key,
         if (status == 200) {
             if (cb(tmp, read, user) != 0) {
                 result = -1;
+                /* the callback bailed mid-body: same rule as the loop-top
+                 * check, a half-read response must not be pooled */
+                http_disconnect();
                 goto out;
             }
         } else {
@@ -3876,12 +3881,29 @@ static void stream_handle_data(struct str data, void *user)
         for (struct jnode *item = tcalls->head; item; item = item->next) {
             if (item->tag != J_OBJ)
                 continue;
-            int64_t idx = jnum_i(jobj_get(item, "index"));
-            struct stream_call *call = stream_call_by_index(st, (size_t)idx);
+            struct jnode *jidx = jobj_get(item, "index");
             struct jnode *jid = jobj_get(item, "id");
-            if (jid && jid->tag == J_STR && jid->raw.n > 0) {
+            char *new_id = (jid && jid->tag == J_STR && jid->raw.n > 0)
+                               ? jstr_dupz(jid)
+                               : NULL;
+            int64_t idx = jnum_i(jidx);
+            if (!jidx) {
+                /* Providers that leave `index` out of the deltas would
+                 * otherwise fold every call into slot 0 and concatenate
+                 * their arguments into unparseable JSON: a fresh id opens
+                 * a slot, a delta without one continues the last. */
+                size_t last = st->n_calls ? st->n_calls - 1 : 0;
+                if (new_id && st->n_calls > 0
+                    && strcmp(st->calls[last].id ? st->calls[last].id : "",
+                              new_id) != 0)
+                    idx = (int64_t)st->n_calls;
+                else
+                    idx = (int64_t)last;
+            }
+            struct stream_call *call = stream_call_by_index(st, (size_t)idx);
+            if (new_id) {
                 free(call->id);
-                call->id = jstr_dupz(jid);
+                call->id = new_id;
             }
             struct jnode *fn = jobj_get(item, "function");
             if (fn && fn->tag == J_OBJ) {
@@ -9268,6 +9290,16 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             session_log_message(slog, tm);
             if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
                 cancelled = 1;
+                /* the assistant message holding all N tool_calls is already
+                 * committed and logged: every call left unrun needs a tool
+                 * message, or the next request is a 400 that --continue
+                 * replays for the rest of the session */
+                for (size_t j = i + 1; j < m->n_calls; j++) {
+                    struct message *stub = conv_add(cv, "tool",
+                                    "(cancelled before this call ran)");
+                    stub->tool_call_id = xstrdup(m->calls[j].id);
+                    session_log_message(slog, stub);
+                }
                 break;
             }
         }
@@ -9308,9 +9340,11 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
      * turn starts light. Endpoints that omit usage are covered by a rough
      * request-size estimate (~1 token per 2 bytes, CJK-heavy). -p mode
      * never compacts (nothing follows). */
-    int64_t prompt_now = turn_in;
-    if (!turn_usage)
-        prompt_now = (int64_t)(last_request_bytes / 2);
+    /* the last round's prompt size IS the current context. turn_in sums
+     * every round of this turn, so a four-round tool loop would trip this
+     * at a quarter of the real usage and fold away live history. */
+    int64_t prompt_now = turn_usage ? g_ctx_tokens
+                                    : (int64_t)(last_request_bytes / 2);
     if (rc == 0 && auto_compact && prompt_now >= compact_window_tokens() / 4 * 3)
         conv_compact(cfg, cv, slog);
     InterlockedExchange(&g_busy, 0);
