@@ -7850,9 +7850,12 @@ static enum edit_result edit_line(struct editor *e, char **out)
                 default:
                     break; /* unknown sequence: consumed, ignored */
                 }
-                if (moved && !e->menu_open)
-                    edit_cursor_pos(e);
-                else
+                if (moved && !e->menu_open) {
+                    if ((int)g_busy != 0)
+                        edit_repaint(e); /* the block caret needs a frame */
+                    else
+                        edit_cursor_pos(e);
+                } else
                     edit_repaint(e);
                 continue;
             }
@@ -7933,11 +7936,17 @@ static enum edit_result edit_line(struct editor *e, char **out)
             break;
         case 0x01: /* Ctrl+A: line start */
             e->cur = 0;
-            edit_cursor_pos(e);
+            if ((int)g_busy != 0)
+                edit_repaint(e); /* the block caret needs a frame */
+            else
+                edit_cursor_pos(e);
             break;
         case 0x05: /* Ctrl+E: line end */
             e->cur = e->text.len;
-            edit_cursor_pos(e);
+            if ((int)g_busy != 0)
+                edit_repaint(e);
+            else
+                edit_cursor_pos(e);
             break;
         case 0x15: /* Ctrl+U: kill line */
             edit_undo_save(e);
