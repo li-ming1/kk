@@ -1308,12 +1308,13 @@ static void out_write_unlocked(const char *s, size_t n)
     }
 }
 
-/* Content-end tracking for the agent thread: the transcript grows at a
- * fixed BUFFER position, set with SetConsoleCursorPosition — immune to
- * viewport scrolls, which shift every VT row address (CUP is relative
- * to the visible window). Under g_out_lock. */
-static volatile LONG g_agent_writes; /* set on the agent thread only */
+/* Content-end tracking: EVERY transcript write (any thread) seeks to the
+ * tracked end and re-tracks after, so the stream always appends after the
+ * last byte no matter where the composer parked the cursor. Panel paints
+ * (composer frame, status row, menu, region setup) go through the
+ * out_frame_* variants which write without seeking. All under g_out_lock. */
 static SHORT g_content_x, g_content_y; /* buffer coords, -1 = unset */
+static int g_no_seek; /* full-screen overlays (session picker) write raw */
 
 /* Seek to the tracked content end and re-track after a write. Lock held. */
 static void content_seek_write(const char *s, size_t n)
@@ -1343,19 +1344,45 @@ static void out_write(const char *s, size_t n)
     if (!n)
         return;
     AcquireSRWLockExclusive(&g_out_lock);
-    if (g_agent_writes)
+    if (g_dock && !g_no_seek)
         content_seek_write(s, n);
     else
         out_write_unlocked(s, n);
     ReleaseSRWLockExclusive(&g_out_lock);
 }
 
-/* Main-thread transcript write while a turn runs (same discipline). */
-static void out_content_puts(const char *s)
+/* Panel paint: write at the cursor, never seek to the content end. */
+static void out_frame_write(const char *s, size_t n)
 {
+    if (!n)
+        return;
     AcquireSRWLockExclusive(&g_out_lock);
-    content_seek_write(s, strlen(s));
+    out_write_unlocked(s, n);
     ReleaseSRWLockExclusive(&g_out_lock);
+}
+
+static void out_frame_puts(const char *s)
+{
+    out_frame_write(s, strlen(s));
+}
+
+/* Panel paint printf; main thread only (composer, menu, picker). */
+static void out_frame_printf(const char *fmt, ...)
+{
+    static struct buf b;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n <= 0)
+        return;
+    buf_reset(&b);
+    buf_reserve(&b, (size_t)n);
+    va_start(ap, fmt);
+    vsnprintf(b.p, (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    b.len = (size_t)n;
+    out_frame_write(b.p, b.len);
 }
 
 static void out_puts(const char *s)
@@ -6788,7 +6815,7 @@ static void ui_rule(int row)
         buf_appends(&rule, "\x1b[0m");
         rule_cols = g_term_cols;
     }
-    out_printf("\x1b[%d;1H\x1b[2K%s", row, rule.p);
+    out_frame_printf("\x1b[%d;1H\x1b[2K%s", row, rule.p);
 }
 
 /* ki's command panel: rule, header, up to cap entries from idx[from..],
@@ -6804,19 +6831,19 @@ static int ui_cmd_panel(int base, const int *idx, int count, int from, int sel,
     if (k < 0)
         k = 0;
     ui_rule(base);
-    out_printf("\x1b[%d;1H\x1b[2K%s", base + 1, header);
+    out_frame_printf("\x1b[%d;1H\x1b[2K%s", base + 1, header);
     for (int i = 0; i < k; i++) {
         const char *name = KK_COMMANDS[idx[from + i]].name;
         const char *desc = KK_COMMANDS[idx[from + i]].desc;
         if (from + i == sel)
-            out_printf("\x1b[%d;1H\x1b[2K\x1b[1m%s\x1b[0m %s", base + 2 + i,
-                       name, desc);
+            out_frame_printf("\x1b[%d;1H\x1b[2K\x1b[1m%s\x1b[0m %s", base + 2 + i,
+                             name, desc);
         else
-            out_printf("\x1b[%d;1H\x1b[2K\x1b[2m%s %s\x1b[0m", base + 2 + i,
-                       name, desc);
+            out_frame_printf("\x1b[%d;1H\x1b[2K\x1b[2m%s %s\x1b[0m", base + 2 + i,
+                             name, desc);
     }
     ui_rule(base + 2 + k);
-    out_printf("\x1b[%d;1H\x1b[2K\x1b[2m%s\x1b[0m", base + 3 + k, hints);
+    out_frame_printf("\x1b[%d;1H\x1b[2K\x1b[2m%s\x1b[0m", base + 3 + k, hints);
     return k;
 }
 
@@ -6841,11 +6868,6 @@ struct editor {
     int saved_valid;
     int home_row;   /* screen row the draft frame starts on (1-based) */
     int drawn_rows; /* rows the last frame occupied: shrink erases them */
-    int content_x;  /* transcript end as BUFFER coords, captured at edit
-                     * start: exit seeks here with SetConsoleCursorPosition
-                     * (VT rows are viewport-relative and break the moment
-                     * the pane has scrollback or the user scrolls) */
-    int content_y;
     int menu_base;  /* first menu row on screen (menu opens above the panel) */
     int menu_count; /* entries currently drawn */
     int menu_from;  /* sliding window start */
@@ -7045,7 +7067,7 @@ static void edit_cursor_pos(struct editor *e)
 {
     char ctl[48];
     int cn = edit_cursor_ctl(e, ctl, sizeof ctl);
-    out_write(ctl, (size_t)cn);
+    out_frame_write(ctl, (size_t)cn);
 }
 
 static void edit_render(struct editor *e)
@@ -7118,7 +7140,7 @@ static void edit_render(struct editor *e)
     char ctl[48];
     int cn = edit_cursor_ctl_at(e, cur_col, cur_row, lo, ctl, sizeof ctl);
     buf_append_n(&frame, ctl, (size_t)cn);
-    out_write(frame.p, frame.len);
+    out_frame_write(frame.p, frame.len);
 }
 
 static void edit_insert(struct editor *e, const char *s, size_t n)
@@ -7465,16 +7487,16 @@ static void edit_menu_draw(struct editor *e)
             const char *name = KK_COMMANDS[match[e->menu_from + i]].name;
             const char *desc = KK_COMMANDS[match[e->menu_from + i]].desc;
             if (e->menu_from + i == e->menu_sel)
-                out_printf("\x1b[%d;1H\x1b[2K\x1b[1m%s\x1b[0m %s",
-                           e->menu_base + i, name, desc);
+                out_frame_printf("\x1b[%d;1H\x1b[2K\x1b[1m%s\x1b[0m %s",
+                                 e->menu_base + i, name, desc);
             else
-                out_printf("\x1b[%d;1H\x1b[2K\x1b[2m%s %s\x1b[0m",
-                           e->menu_base + i, name, desc);
+                out_frame_printf("\x1b[%d;1H\x1b[2K\x1b[2m%s %s\x1b[0m",
+                                 e->menu_base + i, name, desc);
         }
     }
     /* erase the tail of a shrunken draw (close restores the capture) */
     for (int i = total; i < e->menu_height; i++)
-        out_printf("\x1b[%d;1H\x1b[2K", e->menu_base + i);
+        out_frame_printf("\x1b[%d;1H\x1b[2K", e->menu_base + i);
     e->menu_count = count;
     if (count)
         memcpy(e->menu_match, match, (size_t)count * sizeof match[0]);
@@ -7643,20 +7665,6 @@ static enum edit_result edit_line(struct editor *e, char **out)
     e->menu_height = 0;
     e->menu_open = 0;
     e->menu_base = 0;
-    /* capture where the transcript ends, in BUFFER coordinates: output
-     * after the edit (command output, the next turn) grows from this
-     * exact spot. VT rows are viewport-relative and unusable here — the
-     * pane usually carries scrollback above the session. */
-    {
-        CONSOLE_SCREEN_BUFFER_INFO csbi;
-        if (g_console_out && GetConsoleScreenBufferInfo(g_hstdout, &csbi)) {
-            e->content_x = csbi.dwCursorPosition.X;
-            e->content_y = csbi.dwCursorPosition.Y;
-        } else {
-            e->content_x = -1;
-            e->content_y = -1;
-        }
-    }
     e->drawn_rows = 0;
     edit_repaint(e);
     /* bracketed paste: the terminal wraps pasted text in ESC[200~ ..
@@ -7667,22 +7675,28 @@ static enum edit_result edit_line(struct editor *e, char **out)
     int leave = 0;
     struct buf submitted = BUF_INIT; /* the draft, stolen at submit */
     int last_cols = g_term_cols, last_rows = g_term_rows;
+    int last_busy = (int)g_busy;
     while (!leave) {
         unsigned char b;
         if (!term_wait_readable(200)) {
-            /* idle: pick up terminal resizes between keystrokes */
+            /* idle: pick up terminal resizes between keystrokes, and
+             * re-dock the caret when a turn ends (the agent's writes
+             * park the buffer cursor at the content end) */
             term_size_refresh();
-            if (g_term_cols != last_cols || g_term_rows != last_rows) {
+            int busy = (int)g_busy;
+            if (g_term_cols != last_cols || g_term_rows != last_rows
+                || busy != last_busy) {
                 last_cols = g_term_cols;
                 last_rows = g_term_rows;
-                out_printf("\x1b[1;%dr", dock_scroll_bottom());
+                last_busy = busy;
+                out_frame_printf("\x1b[1;%dr", dock_scroll_bottom());
                 /* the old frame's rows are stale after a reflow: erase
                  * them before the repaint re-docks the panel */
                 if (e->drawn_rows > 0) {
                     int last = e->home_row + e->drawn_rows;
                     for (int r = e->home_row;
                          r < last && r <= g_term_rows; r++)
-                        out_printf("\x1b[%d;1H\x1b[2K", r);
+                        out_frame_printf("\x1b[%d;1H\x1b[2K", r);
                 }
                 e->drawn_rows = 0;
                 edit_repaint(e);
@@ -7927,11 +7941,6 @@ static enum edit_result edit_line(struct editor *e, char **out)
 
     edit_menu_clear(e);
     out_puts("\x1b[?2004l"); /* bracketed paste off */
-    /* leave: put the cursor back at the content end (buffer coords) so
-     * command output and streaming grow from where the transcript left */
-    if (e->content_y >= 0)
-        SetConsoleCursorPosition(
-            g_hstdout, (COORD){(SHORT)e->content_x, (SHORT)e->content_y});
     if (result == EDIT_CANCEL)
         out_puts("^C\r\n");
     else if (result == EDIT_EOF)
@@ -8021,7 +8030,9 @@ static int session_pick(char *path, size_t cap)
         list_rows = total;
     if (list_rows < 1)
         list_rows = 1;
-    /* reset the dock's scroll region, take over the screen, clear once */
+    /* reset the dock's scroll region, take over the screen, clear once;
+     * the picker paints raw (full-screen overlay, no content seeking) */
+    g_no_seek = 1;
     out_puts("\x1b[r\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
     int leave = 0, picked = 0, dirty = 1;
     /* raw VT bytes like the composer: arrows arrive as ESC [ A/B … */
@@ -8100,6 +8111,7 @@ static int session_pick(char *path, size_t cap)
             from = 0;
     }
     out_puts("\x1b[?25h\x1b[?1049l");
+    g_no_seek = 0;
     term_raw_end(saved);
     if (picked) {
         snprintf(path, cap, "%s", rows[sel].path);
@@ -8269,9 +8281,7 @@ static HANDLE g_agent_thread;
 static DWORD WINAPI agent_thread_proc(LPVOID arg)
 {
     struct agent_args *a = arg;
-    InterlockedExchange(&g_agent_writes, 1);
     agent_loop(a->cfg, a->cv, a->slog, a->sysp, 1);
-    InterlockedExchange(&g_agent_writes, 0);
     out_printf_thread_end();
     free(a);
     return 0;
@@ -8298,7 +8308,7 @@ static int run_repl(struct config *cfg)
     if (dock) {
         term_size_refresh();
         dock_row = g_term_rows;
-        out_printf("\x1b[1;%dr", dock_scroll_bottom());
+        out_frame_printf("\x1b[1;%dr", dock_scroll_bottom());
         /* the transcript must start at viewport row 1: the scroll region
          * (DECSTBM) is viewport-relative, so old pane content above the
          * session would put the content end outside the region and
@@ -8333,10 +8343,9 @@ static int run_repl(struct config *cfg)
             term_size_refresh();
             if (dock_row != g_term_rows) {
                 dock_row = g_term_rows; /* re-anchor after a resize */
-                out_printf("\x1b[1;%dr", dock_scroll_bottom());
+                out_frame_printf("\x1b[1;%dr", dock_scroll_bottom());
             }
-            /* the composer panel owns the docked bottom rows; edit_line
-             * captures the content end itself */
+            /* the composer panel owns the docked bottom rows */
             er = edit_line(&ed, &line);
         } else if (g_console_in) {
             out_puts("> ");
@@ -8386,7 +8395,7 @@ static int run_repl(struct config *cfg)
              * the next request; slash commands wait (they touch session
              * state the turn owns) */
             if (line[0] == '/') {
-                out_content_puts(
+                out_puts(
                     "\x1b[2m回合进行中：命令请先 Ctrl+C 打断再执行\x1b[0m\r\n");
             } else {
                 queue_user_line(line);
@@ -8401,14 +8410,7 @@ static int run_repl(struct config *cfg)
         } else if (dock) {
             /* start a turn on the agent thread: the text feeds through
              * g_queued (turn_feed_queue echoes it as the cyan bars) and
-             * the composer keeps running right here. The content end is
-             * captured in BUFFER coords: the cursor trails the transcript
-             * because edit_line just repositioned it there. */
-            CONSOLE_SCREEN_BUFFER_INFO csbi;
-            if (g_console_out && GetConsoleScreenBufferInfo(g_hstdout, &csbi)) {
-                g_content_x = csbi.dwCursorPosition.X;
-                g_content_y = csbi.dwCursorPosition.Y;
-            }
+             * the composer keeps running right here */
             queue_user_line(line);
             if (g_agent_thread)
                 CloseHandle(g_agent_thread); /* previous turn, reaped */
@@ -8440,10 +8442,10 @@ static int run_repl(struct config *cfg)
     session_close(&slog);
     conv_free(&cv);
     if (dock) {
-        out_puts("\x1b[r"); /* release the scroll region */
+        out_frame_puts("\x1b[r"); /* release the scroll region */
         if (dock_row > 0)
-            out_printf("\x1b[%d;1H", dock_row);
-        out_puts("\r\n");
+            out_frame_printf("\x1b[%d;1H", dock_row);
+        out_frame_puts("\r\n");
     }
     g_dock = 0;
     return 0;
