@@ -4380,6 +4380,26 @@ static char *file_read_all(const char *path, size_t *out_len)
     return file_read_all_up_to(path, out_len, FILE_READ_CAP);
 }
 
+/* The first cap bytes whatever the file size — file_read_all_up_to refuses
+ * anything larger instead of truncating, and a SKILL.md body runs to 17KB
+ * while only its frontmatter is of interest. */
+static char *file_read_head(const char *path, size_t cap, size_t *out_len)
+{
+    wchar_t *w = path_to_w(path);
+    HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    if (f == INVALID_HANDLE_VALUE)
+        return NULL;
+    char *data = xmalloc(cap + 1);
+    DWORD got = 0;
+    ReadFile(f, data, (DWORD)cap, &got, NULL);
+    CloseHandle(f);
+    data[got] = '\0';
+    *out_len = got;
+    return data;
+}
+
 static int file_write_all(const char *path, const char *data, size_t n)
 {
     /* create parent directories, one level per separator */
@@ -6910,6 +6930,236 @@ static char *load_agents_md(void)
     return any ? buf_detach(&out) : NULL;
 }
 
+/* --- skills: index in the prompt, bodies pulled with read ---------------- */
+
+#define SKILL_ROOT_MAX  2
+#define SKILL_MAX       32
+#define SKILL_NAME_MAX  64
+#define SKILL_DESC_MAX  600  /* these descriptions are written for routing;
+                              * cutting them short costs the "use when" half */
+#define SKILL_HEAD_MAX  16384 /* only the frontmatter is ever looked at */
+#define SKILL_INDEX_MAX 12288
+
+/* Collapse a byte run into single-spaced text: YAML folds block scalars
+ * across indented lines, and the index wants one line per skill. */
+static void buf_append_collapsed(struct buf *b, const char *s, size_t n)
+{
+    int pending = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            pending = b->len != 0;
+            continue;
+        }
+        if (pending)
+            buf_appendc(b, ' ');
+        pending = 0;
+        buf_appendc(b, c);
+    }
+}
+
+/* One top-level frontmatter key. Handles `key: value`, `key: "value"` and
+ * `key: |` / `key: >` block scalars (whose text is the indented run below).
+ * Returns a heap string (possibly empty) or NULL when the key is absent. */
+static char *fm_value(const char *fm, const char *key)
+{
+    const size_t klen = strlen(key);
+    const char *p = fm;
+    while (p && *p) {
+        const char *eol = strchr(p, '\n');
+        if (strncmp(p, key, klen) == 0 && p[klen] == ':') {
+            const char *v = p + klen + 1;
+            while (*v == ' ' || *v == '\t')
+                v++;
+            const char *vend;
+            int block = 0;
+            if (*v == '|' || *v == '>') {
+                /* a block scalar is declared by | or > with nothing but
+                 * chomping/indent indicators left on the line */
+                const char *t = v + 1;
+                while (t < eol && (*t == '-' || *t == '+'
+                                   || (*t >= '0' && *t <= '9')))
+                    t++;
+                while (t < eol && (*t == ' ' || *t == '\t'))
+                    t++;
+                block = (t == eol);
+            }
+            if (block) {
+                /* the value is the indented run BELOW the indicator */
+                v = eol ? eol + 1 : v + strlen(v);
+                const char *q = v, *last = v;
+                while (*q) {
+                    const char *qe = strchr(q, '\n');
+                    size_t ql = qe ? (size_t)(qe - q) : strlen(q);
+                    if (ql == 3 && strncmp(q, "---", 3) == 0)
+                        break; /* closing fence of the frontmatter */
+                    int blank = 1;
+                    for (size_t i = 0; i < ql; i++)
+                        if (q[i] != ' ' && q[i] != '\t' && q[i] != '\r')
+                            blank = 0;
+                    if (!blank && q[0] != ' ' && q[0] != '\t')
+                        break; /* next key at column 0 ends the block */
+                    last = qe ? qe + 1 : q + ql;
+                    q = last;
+                }
+                vend = last;
+            } else {
+                vend = eol ? eol : v + strlen(v);
+                while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t'
+                                    || vend[-1] == '\r'))
+                    vend--;
+                if (vend - v >= 2 && (*v == '"' || *v == '\'')
+                    && vend[-1] == *v) {
+                    v++;
+                    vend--;
+                }
+            }
+            struct buf b = BUF_INIT;
+            buf_append_collapsed(&b, v, (size_t)(vend - v));
+            return buf_detach(&b);
+        }
+        p = eol ? eol + 1 : NULL;
+    }
+    return NULL;
+}
+
+/* Index entry for one skill directory, or NULL to skip it. */
+static void skill_describe(const char *dir, const char *dname, struct buf *out,
+                           size_t *bytes)
+{
+    char *path = xasprintf("%s\\SKILL.md", dir);
+    size_t len = 0;
+    char *data = file_read_head(path, SKILL_HEAD_MAX, &len);
+    if (!data)
+        goto done;
+    char *fm = data;
+    if ((unsigned char)fm[0] == 0xEF && (unsigned char)fm[1] == 0xBB
+        && (unsigned char)fm[2] == 0xBF)
+        fm += 3; /* UTF-8 BOM */
+    if (strncmp(fm, "---", 3) != 0)
+        goto done_file;
+    char *end = strstr(fm + 3, "\n---");
+    if (!end)
+        goto done_file; /* unterminated frontmatter: not worth guessing */
+
+    char *name = fm_value(fm, "name");
+    char *desc = fm_value(fm, "description");
+    if (!name || !*name) {
+        free(name);
+        name = xstrdup(dname); /* the directory is the fallback name */
+    }
+    size_t dlen = desc ? strlen(desc) : 0;
+    int clipped = 0;
+    if (dlen > SKILL_DESC_MAX) {
+        size_t cut = SKILL_DESC_MAX;
+        while (cut > 0 && (desc[cut] & 0xC0) == 0x80)
+            cut--; /* never split a UTF-8 sequence */
+        size_t floor_at = cut > 40 ? cut - 40 : 0;
+        size_t w = cut;
+        while (w > floor_at && desc[w] != ' ')
+            w--;
+        if (w > floor_at)
+            cut = w; /* end on a word, not mid-token */
+        desc[cut] = '\0';
+        dlen = cut;
+        clipped = 1;
+    }
+    size_t need = strlen(name) + dlen + strlen(path) + 16;
+    if (*bytes + need > SKILL_INDEX_MAX) {
+        free(name);
+        free(desc);
+        goto done_file;
+    }
+    *bytes += need;
+    buf_appends(out, "- ");
+    buf_appends(out, name);
+    if (dlen) {
+        buf_appends(out, ": ");
+        buf_append_n(out, desc, dlen);
+        if (clipped)
+            buf_appends(out, "\xE2\x80\xA6"); /* …: the body is one read away */
+        buf_appends(out, "\n  \xE2\x86\x92 read "); /* → */
+    } else {
+        buf_appends(out, "\n  \xE2\x86\x92 read ");
+    }
+    buf_appends(out, path);
+    buf_appends(out, "\n");
+    free(name);
+    free(desc);
+done_file:
+    free(data);
+done:
+    free(path);
+}
+
+/* <root>/<name>/SKILL.md for every skill directory under each root. Project
+ * skills come first so a workspace can shadow a user-level name. */
+static char *load_skills(void)
+{
+    char *roots[SKILL_ROOT_MAX];
+    int nroots = 0;
+    /* project root first: a workspace shadows a user-level name */
+    char cwd[MAX_PATH];
+    if (GetCurrentDirectoryA(MAX_PATH, cwd))
+        roots[nroots++] = xasprintf("%s\\.agents\\skills", cwd);
+    char *home = env_get("USERPROFILE");
+    if (home && nroots < SKILL_ROOT_MAX)
+        roots[nroots++] = xasprintf("%s\\.agents\\skills", home);
+    free(home);
+
+    DA(char *) seen = {0};
+    struct buf out = BUF_INIT;
+    size_t bytes = 0;
+    int listed = 0;
+
+    for (int r = 0; r < nroots && listed < SKILL_MAX; r++) {
+        char *pat = xasprintf("%s\\*", roots[r]);
+        WIN32_FIND_DATAA fd;
+        HANDLE find = FindFirstFileA(pat, &fd);
+        free(pat);
+        if (find == INVALID_HANDLE_VALUE)
+            continue; /* root absent: the common case */
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                continue;
+            if (fd.cFileName[0] == '.')
+                continue;
+            int dup = 0;
+            for (size_t i = 0; i < seen.n; i++)
+                if (strcmp(seen.p[i], fd.cFileName) == 0)
+                    dup = 1;
+            if (dup)
+                continue;
+            char *dir = xasprintf("%s\\%s", roots[r], fd.cFileName);
+            skill_describe(dir, fd.cFileName, &out, &bytes);
+            DA_PUSH(seen, xstrdup(fd.cFileName));
+            listed++;
+            free(dir);
+        } while (listed < SKILL_MAX && FindNextFileA(find, &fd));
+        FindClose(find);
+    }
+    for (size_t i = 0; i < seen.n; i++)
+        free(seen.p[i]);
+    DA_FREE(seen);
+    for (int r = 0; r < nroots; r++)
+        free(roots[r]);
+    if (!out.len) {
+        buf_free(&out);
+        return NULL;
+    }
+    struct buf head = BUF_INIT;
+    buf_appends(&head,
+                "# Skills\n\n"
+                "Skill guides installed on this machine. A line below is a "
+                "summary, not the instructions: when a task matches one, "
+                "read its SKILL.md and follow it before acting, and read "
+                "any file it points to the same way. Never act on a skill "
+                "you have not read.\n\n");
+    buf_append_n(&head, out.p, out.len);
+    buf_free(&out);
+    return buf_detach(&head);
+}
+
 /* --- slash command menu (ki-style picker under the composer) ----------- */
 
 static const struct {
@@ -6917,6 +7167,7 @@ static const struct {
 } KK_COMMANDS[] = {
     { "/new", "开启全新会话" },
     { "/resume", "切换到其他会话" },
+    { "/skills", "列出模型可按需读取的 skill" },
     { "/compact", "把早期历史压缩为摘要" },
 };
 #define KK_N_COMMANDS (sizeof KK_COMMANDS / sizeof KK_COMMANDS[0])
@@ -8354,6 +8605,12 @@ static char *system_prompt_build(void)
         buf_appends(&b, agents);
         free(agents);
     }
+    char *skills = load_skills();
+    if (skills) {
+        buf_appends(&b, "\n\n");
+        buf_appends(&b, skills);
+        free(skills);
+    }
     return buf_detach(&b);
 }
 
@@ -8384,6 +8641,22 @@ static int cmd_slash(struct config *cfg, const char *line,
          * the first launch — banner, empty transcript */
         session_reset_screen();
         repl_banner();
+        return 1;
+    }
+    if (strcmp(name, "/skills") == 0) {
+        /* exactly the block the system prompt carries, so what you read
+         * here is what the model is offered */
+        char *s = load_skills();
+        if (!s) {
+            out_puts("没有可列出的 skill：在 %USERPROFILE%\\.agents\\skills"
+                     " 或 <工作区>\\.agents\\skills 下放 <名字>\\SKILL.md\r\n");
+            return 1;
+        }
+        for (char *p = s, *nl; p && *p; p = nl ? nl + 1 : NULL) {
+            nl = strchr(p, '\n');
+            out_printf("%.*s\r\n", nl ? (int)(nl - p) : (int)strlen(p), p);
+        }
+        free(s);
         return 1;
     }
     if (strcmp(name, "/resume") == 0) {
