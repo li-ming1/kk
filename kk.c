@@ -9040,6 +9040,31 @@ static char *api_error_message(const char *body)
     return out;
 }
 
+/* Hard ceiling on what one response may generate. Without it a degenerate
+ * repetition loop bills unbounded output and then sits in the session log
+ * forever: one captured run put 757,988 characters (~190k tokens, 98% of it
+ * the same sentence repeated) into a single assistant message. The default
+ * keeps ~3x headroom over writing a 40KB file, whose content also counts as
+ * output. */
+static int64_t max_output_tokens(void)
+{
+    static int64_t cached;
+    static int read;
+    if (!read) {
+        read = 1;
+        cached = 32768;
+        const char *e = env_get("KK_MAX_OUTPUT_TOKENS");
+        if (e) {
+            int64_t v = 0;
+            while (*e >= '0' && *e <= '9')
+                v = v * 10 + (*e++ - '0');
+            if (v >= 1)
+                cached = v;
+        }
+    }
+    return cached;
+}
+
 /* One model round-trip: POST and stream into hooks. Returns HTTP status,
  * 0 on a transport error, or -1 when cancelled. st carries the result.
  * (cv is non-const: serialization caches fragments on the messages.) */
@@ -9100,7 +9125,10 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
         buf_appends(&body, "],\"tools\":[");
         buf_append_n(&body, tools_json.p, tools_json.len);
     }
-    buf_appends(&body, "],\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+    buf_appendf(&body,
+                "],\"stream\":true,\"max_tokens\":%lld,"
+                "\"stream_options\":{\"include_usage\":true}}",
+                (long long)max_output_tokens());
     last_body = body.len;
 
     struct chat_request cr;
