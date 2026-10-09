@@ -9484,6 +9484,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     if (g_emit_vt)
         out_frame_puts("\x1b[?25l");
     int64_t turn_in = 0, turn_out = 0, turn_cache = 0;
+    DWORD gen_ms = 0; /* time inside chat_stream, across every round */
     int turn_usage = 0, turn_has_cache = 0;
     size_t last_request_bytes = 0;
     int compacted_once = 0;
@@ -9518,7 +9519,9 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         int attempt = 0;
         int status;
         for (;;) {
+            DWORD t_req = GetTickCount();
             status = chat_stream(cfg, cv, system_prompt, 1, &hooks, &st);
+            gen_ms += GetTickCount() - t_req;
             last_request_bytes = st.request_bytes;
             if (status == -1)
                 break; /* cancelled */
@@ -9744,15 +9747,24 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
          * and total wall time, then a blank row for the next composer */
         char fs[16];
         fmt_secs(fs, sizeof fs, (GetTickCount() - g_turn_start) / 1000);
+        /* Rate over stream time only: wall time includes the tool runs
+         * between rounds, which would make a build-heavy turn read ~1 t/s */
+        char tps[20];
+        tps[0] = '\0';
+        if (gen_ms && turn_out > 0) {
+            int64_t t10 = (turn_out * 10000) / (int64_t)gen_ms;
+            snprintf(tps, sizeof tps, " · %lld.%d t/s", (long long)(t10 / 10),
+                     (int)(t10 % 10));
+        }
         if (g_emit_vt)
             out_puts("\x1b[2m");
         if (turn_has_cache && turn_in > 0)
-            out_printf("[in %lld · out %lld · ch %d%% · %s]\r\n",
-                       (long long)turn_in, (long long)turn_out,
+            out_printf("[in %lld · out %lld%s · ch %d%% · %s]\r\n",
+                       (long long)turn_in, (long long)turn_out, tps,
                        (int)(turn_cache * 100 / turn_in), fs);
         else
-            out_printf("[in %lld · out %lld · %s]\r\n", (long long)turn_in,
-                       (long long)turn_out, fs);
+            out_printf("[in %lld · out %lld%s · %s]\r\n", (long long)turn_in,
+                       (long long)turn_out, tps, fs);
         if (g_emit_vt)
             out_puts("\x1b[0m");
         out_puts("\r\n");
