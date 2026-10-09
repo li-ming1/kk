@@ -1636,6 +1636,7 @@ static DWORD WINAPI queue_reader_thread(LPVOID arg)
     DWORD saved;
     if (!term_raw_begin(&saved))
         return 0;
+    int in_paste = 0, swallow_lf = 0;
     while (g_emit_vt && g_console_in && (int)g_busy != 0) {
         if (!term_wait_readable(15))
             continue;
@@ -1651,18 +1652,26 @@ static DWORD WINAPI queue_reader_thread(LPVOID arg)
                 unsigned char s;
                 if (term_read_byte_timeout(&s, 50) <= 0) {
                     /* lone esc: plain cancel */
-                    InterlockedExchange(&g_cancel, 1);
+                    if (!in_paste)
+                        InterlockedExchange(&g_cancel, 1);
                 } else if (s == '[' || s == 'O') {
                     /* a terminal sequence (arrows, paste markers):
-                     * drain it — arrow keys never steer or cancel */
+                     * drain it — arrow keys never steer or cancel;
+                     * 200~/201~ toggle the paste fold */
+                    char params[16];
                     size_t np;
-                    csi_read(NULL, 0, &np);
+                    unsigned char final = csi_read(params, sizeof params, &np);
+                    if (final == '~' && np == 3 && params[0] == '2'
+                        && params[1] == '0')
+                        in_paste = params[2] == '0';
+                    swallow_lf = 0;
                 }
                 continue;
             }
             AcquireSRWLockExclusive(&g_out_lock);
             if (b == 0x08 || b == 0x7F) {
                 /* backspace: drop one UTF-8 character */
+                swallow_lf = 0;
                 while (g_stage_len > 0
                        && (g_stage[g_stage_len - 1] & 0xC0) == 0x80)
                     g_stage_len--;
@@ -1671,15 +1680,26 @@ static DWORD WINAPI queue_reader_thread(LPVOID arg)
                 g_stage[g_stage_len] = '\0';
             } else if (b == '\r' || b == '\n') {
                 /* enter with content: interrupt the run now and let the
-                 * staged text drive the next request */
-                stage_enqueue();
-                if (g_queued.len) {
-                    InterlockedExchange(&g_steer, 1);
-                    InterlockedExchange(&g_cancel, 1);
+                 * staged text drive the next request; a newline inside a
+                 * paste folds into the staged text instead */
+                int crlf = b == '\n' && swallow_lf;
+                swallow_lf = b == '\r';
+                if (in_paste) {
+                    if (!crlf && g_stage_len < sizeof g_stage - 1) {
+                        g_stage[g_stage_len++] = '\n';
+                        g_stage[g_stage_len] = '\0';
+                    }
+                } else if (!crlf) {
+                    stage_enqueue();
+                    if (g_queued.len) {
+                        InterlockedExchange(&g_steer, 1);
+                        InterlockedExchange(&g_cancel, 1);
+                    }
                 }
             } else if (b >= 0x20 && b != 0x7F) {
                 /* raw UTF-8 bytes append directly: multi-byte chars
                  * assemble themselves in the staging line */
+                swallow_lf = 0;
                 if (g_stage_len < sizeof g_stage - 1) {
                     g_stage[g_stage_len++] = (char)b;
                     g_stage[g_stage_len] = '\0';
