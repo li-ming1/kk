@@ -4174,7 +4174,11 @@ static const struct tool_spec KK_TOOLS[] = {
         "command ($ErrorActionPreference is Stop): a failing cmdlet "
         "aborts the rest of the command line, reports the error, and "
         "yields exit 1 — chain steps with explicit -ErrorAction or "
-        "try/catch when continuation is intended.",
+        "try/catch when continuation is intended. Each call costs a "
+        "round-trip through the shell, so keep it for what the other "
+        "tools cannot do (git, builds, running programs, processes): "
+        "listing files is find, searching contents is grep, reading a "
+        "known file is read.",
         "{\"command\":{\"type\":\"string\",\"description\":\"the command to "
         "run\"},"
         "\"timeout_ms\":{\"type\":\"integer\",\"description\":\"kill after "
@@ -4185,12 +4189,15 @@ static const struct tool_spec KK_TOOLS[] = {
     },
     {
         "find",
-        "Find files in the workspace by NAME (not content). With query: "
-        "fuzzy-matches paths against a fragment like kk or render — use it "
-        "when the exact path is unknown. With glob: lists files matching a "
-        "pattern like *.py or src/**/*test*. Ranking learns which files "
-        "this workspace touches most. Returns relative paths with sizes "
-        "and git status.",
+        "Find files in the workspace by NAME (not content), and answer "
+        "\"what is here\": with no arguments it lists the most-touched "
+        "files, a fragment like kk or render fuzzy-matches paths, a glob "
+        "like *.c or src/**/*test* filters by pattern. Use this instead of "
+        "shell Get-ChildItem/dir/ls — it reads a warm in-process index, so "
+        "it costs far less than running a command. Ranking learns which "
+        "files this workspace touches most. Returns relative paths with "
+        "sizes and git status, 20 per page, rooted where kk started (a "
+        "bash cd does not move it).",
         "{\"query\":{\"type\":\"string\",\"description\":\"fuzzy file name "
         "query, e.g. kk or render\"},"
         "\"glob\":{\"type\":\"string\",\"description\":\"optional glob "
@@ -4203,13 +4210,16 @@ static const struct tool_spec KK_TOOLS[] = {
     },
     {
         "grep",
-        "Search file CONTENTS across the workspace. Plain-text matching "
-        "(smart_case: all-lowercase queries are case-insensitive); set "
-        "regex for regular expressions. A query may carry a file filter "
-        "like '*.rs pattern' or 'src/ pattern', and newlines turn it into "
-        "a multi-pattern OR search in one pass. Definition lines are "
-        "tagged [def]. Returns path:line:text matches with line numbers — "
-        "use them to read or make a precise replacement.",
+        "Search file CONTENTS across the workspace. Use this instead of "
+        "shell Select-String/findstr/grep, including when you already know "
+        "the one file. Plain-text matching (smart_case: all-lowercase "
+        "queries are case-insensitive); set regex for regular expressions. "
+        "A query may carry a file filter like '*.rs pattern', 'src/ "
+        "pattern' or 'kk.c pattern' (a bare name narrows to that file), and "
+        "newlines turn it into a multi-pattern OR search in one pass. "
+        "Definition lines are tagged [def]. Returns path:line:text matches "
+        "with line numbers — use them to read or make a precise "
+        "replacement.",
         "{\"query\":{\"type\":\"string\",\"description\":\"text to search "
         "for; optionally 'glob pattern' to filter files, or multiple "
         "patterns separated by newlines for OR search\"},"
@@ -4275,6 +4285,8 @@ static char *args_summary(const struct jnode *args, const char *tool)
         s = args_str(args, "glob"); /* find's glob mode has no query */
         if (!s || !*s) {
             free(s);
+            if (strcmp(tool, "find") == 0)
+                return xstrdup("（列工作集）"); /* argument-less find */
             return xstrdup("");
         }
     }
@@ -4673,10 +4685,11 @@ static char *tool_find(const struct jnode *args)
 {
     char *query = args_str(args, "query");
     char *glob = args_str(args, "glob");
-    if ((!query || !*query) && (!glob || !*glob)) {
+    if (glob && !*glob) {
         free(query);
         free(glob);
-        return xstrdup("error: find requires a query");
+        return xstrdup("error: find glob is empty; omit glob to search by "
+                       "name, or pass no arguments to list the workspace");
     }
     if (!fff_ensure()) {
         free(query);
@@ -4692,7 +4705,9 @@ static char *tool_find(const struct jnode *args)
         tracked = glob; /* glob mode: rank by frecency, no fuzzy needed */
         r = p_glob(fff_inst, glob, NULL, 0, (uint32_t)off, 20);
     } else {
-        r = p_search(fff_inst, query, NULL, 0, (uint32_t)off, 20, 0, 0);
+        /* an empty query is fff's "whole index, ranked by frecency" */
+        r = p_search(fff_inst, query ? query : "", NULL, 0, (uint32_t)off,
+                     20, 0, 0);
     }
     if (!r) {
         free(query);
@@ -4727,12 +4742,15 @@ static char *tool_find(const struct jnode *args)
     if (p_isscanning && p_isscanning(fff_inst))
         buf_appends(&out, "[workspace index still scanning: results may "
                           "be incomplete; re-run shortly]\n");
-    if (sr->total_matched > 20 + (uint32_t)off)
-        buf_appendf(&out, "[showing entries %llu-%llu; re-run with offset "
-                          "%llu for the next page]\n",
-                    (unsigned long long)off + 1,
-                    (unsigned long long)off + sr->count,
-                    (unsigned long long)off + sr->count);
+    /* offset is a fff page index, so the entry numbers have to be scaled
+     * out of it — telling the model to re-run at off+count would skip
+     * (count/20 - 1) whole pages */
+    uint32_t first = (uint32_t)off * 20;
+    if (sr->count > 0 && sr->total_matched > first + sr->count)
+        buf_appendf(&out, "[showing entries %u-%u of %u; re-run with offset "
+                          "%u for the next page]\n",
+                    first + 1, first + sr->count, sr->total_matched,
+                    (uint32_t)off + 1);
     p_free_search(sr);
     p_free(r);
     return buf_detach(&out);
@@ -4782,22 +4800,26 @@ static char *tool_grep(const struct jnode *args)
     }
     struct FffGrepResult *gr = r->handle;
     struct buf out = BUF_INIT;
+    uint32_t shown = 0;
     for (uint32_t i = 0; i < gr->count && i < 30; i++) {
         const struct FffGrepMatch *m = &gr->items[i];
         if (m->is_binary)
             continue;
+        /* "before" lines must print above their match: after it, the model
+         * reads the file backwards */
+        for (uint32_t cb = 0; cb < m->context_before_count; cb++)
+            grep_context_line(&out, m->context_before[cb]);
         buf_appendf(&out, "%s:%llu: ", m->relative_path,
                     (unsigned long long)m->line_number);
         if (m->is_definition)
             buf_appends(&out, "[def] ");
         buf_append_line_capped(&out, m->line_content ? m->line_content : "",
                                m->line_content ? strlen(m->line_content) : 0);
-        for (uint32_t cb = 0; cb < m->context_before_count; cb++)
-            grep_context_line(&out, m->context_before[cb]);
         for (uint32_t ca = 0; ca < m->context_after_count; ca++)
             grep_context_line(&out, m->context_after[ca]);
+        shown++;
     }
-    buf_appendf(&out, "%u matches\n", gr->count);
+    buf_appendf(&out, "%u matches\n", shown); /* binary hits are not shown */
     if (p_isscanning && p_isscanning(fff_inst))
         buf_appends(&out, "[workspace index still scanning: results may "
                           "be incomplete; re-run shortly]\n");
@@ -5203,6 +5225,8 @@ static char *tool_read(const struct jnode *args)
     int64_t limit = args_int(args, "limit", 2000);
     if (offset < 1)
         offset = 1;
+    if (limit < 1)
+        limit = 2000; /* the emit compare casts to size_t: -1 means no cap */
 
     /* refuse sizes file_read_all would refuse, but with an honest
      * message: a silent "cannot read" on a file that plainly exists
@@ -5734,6 +5758,24 @@ static void clixml_text(struct buf *out, const char *s, size_t n)
             && s[i + 6] == '_') {
             int cp = hex4(s + i + 2);
             if (cp >= 0) {
+                /* An astral character arrives as two _xHHHH_ escapes
+                 * holding one UTF-16 surrogate pair; u8_encode has no
+                 * surrogate guard, so fold the pair and floor a stray
+                 * half to U+FFFD. */
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    int lo = -1;
+                    if (i + 14 <= n && s[i + 7] == '_' && s[i + 8] == 'x'
+                        && s[i + 13] == '_')
+                        lo = hex4(s + i + 9);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        i += 7;
+                    } else {
+                        cp = 0xFFFD;
+                    }
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    cp = 0xFFFD;
+                }
                 char tmp[4];
                 buf_append_n(out, tmp, u8_encode((uint32_t)cp, tmp));
                 i += 7;
