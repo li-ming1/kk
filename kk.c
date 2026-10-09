@@ -1308,41 +1308,33 @@ static void out_write_unlocked(const char *s, size_t n)
     }
 }
 
-/* Content-end tracking for the agent thread: it writes the transcript
- * while the composer (main thread) parks the cursor in the draft, so
- * every agent write seeks to the tracked end first and re-tracks after.
- * Kept under g_out_lock. */
+/* Content-end tracking for the agent thread: the transcript grows at a
+ * fixed BUFFER position, set with SetConsoleCursorPosition — immune to
+ * viewport scrolls, which shift every VT row address (CUP is relative
+ * to the visible window). Under g_out_lock. */
 static volatile LONG g_agent_writes; /* set on the agent thread only */
-static int g_content_row, g_content_col;
-
-/* Last row of the scroll region: just above the tallest possible panel. */
-static int dock_scroll_bottom(void)
-{
-    int b = g_term_rows - 13;
-    return b > 0 ? b : 1;
-}
+static SHORT g_content_x, g_content_y; /* buffer coords, -1 = unset */
 
 /* Seek to the tracked content end and re-track after a write. Lock held. */
 static void content_seek_write(const char *s, size_t n)
 {
-    if (g_content_row < 1) {
-        int r = 0, c = 0;
-        cursor_abs(&r, &c);
-        g_content_row = r > 0 ? r : 1;
-        g_content_col = c > 0 ? c : 1;
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (g_content_y < 0) {
+        if (!g_console_out
+            || !GetConsoleScreenBufferInfo(g_hstdout, &csbi)) {
+            out_write_unlocked(s, n); /* no console: write at the cursor */
+            return;
+        }
+        g_content_x = csbi.dwCursorPosition.X;
+        g_content_y = csbi.dwCursorPosition.Y;
     }
-    if (g_content_row > dock_scroll_bottom())
-        g_content_row = dock_scroll_bottom();
-    char ctl[32];
-    int cn = snprintf(ctl, sizeof ctl, "\x1b[%d;%dH", g_content_row,
-                      g_content_col);
-    out_write_unlocked(ctl, (size_t)cn);
+    if (g_console_out)
+        SetConsoleCursorPosition(
+            g_hstdout, (COORD){g_content_x, g_content_y});
     out_write_unlocked(s, n);
-    int r = 0, c = 0;
-    cursor_abs(&r, &c);
-    if (r > 0) {
-        g_content_row = r;
-        g_content_col = c > 0 ? c : 1;
+    if (g_console_out && GetConsoleScreenBufferInfo(g_hstdout, &csbi)) {
+        g_content_x = csbi.dwCursorPosition.X;
+        g_content_y = csbi.dwCursorPosition.Y;
     }
 }
 
@@ -1475,6 +1467,13 @@ static struct buf g_queued;           /* pending new-input lines, \n separated *
 static volatile LONG g_steer;         /* enter with content: inject + interrupt */
 static char g_tick_label[160];        /* running tool for the status line */
 static DWORD g_tick_start;            /* when the running tool started */
+
+/* Last row of the scroll region: just above the tallest possible panel. */
+static int dock_scroll_bottom(void)
+{
+    int b = g_term_rows - 13;
+    return b > 0 ? b : 1;
+}
 
 /* Fixed dock: the composer panel pins to the bottom edge (rule + draft
  * window + hint + rule + status, 4..13 rows tall) and every painter
@@ -8397,11 +8396,15 @@ static int run_repl(struct config *cfg)
         } else if (dock) {
             /* start a turn on the agent thread: the text feeds through
              * g_queued (turn_feed_queue echoes it as the cyan bars) and
-             * the composer keeps running right here */
+             * the composer keeps running right here. The content end is
+             * captured in BUFFER coords: the cursor trails the transcript
+             * because edit_line just repositioned it there. */
+            CONSOLE_SCREEN_BUFFER_INFO csbi;
+            if (g_console_out && GetConsoleScreenBufferInfo(g_hstdout, &csbi)) {
+                g_content_x = csbi.dwCursorPosition.X;
+                g_content_y = csbi.dwCursorPosition.Y;
+            }
             queue_user_line(line);
-            cursor_abs(&g_content_row, &g_content_col);
-            if (g_content_col < 1)
-                g_content_col = 1;
             if (g_agent_thread)
                 CloseHandle(g_agent_thread); /* previous turn, reaped */
             struct agent_args *aa = xmalloc(sizeof *aa);
