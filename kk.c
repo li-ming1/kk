@@ -7097,9 +7097,52 @@ static void edit_render(struct editor *e)
      * cursor is doing, the draft lands where the dock put it */
     buf_appendf(&frame, "\x1b[%d;1H", e->home_row);
     edit_rule_append(&frame);
+    int busy = (int)g_busy;
     for (int i = 0; i < shown; i++) {
         buf_appends(&frame, "\r\n");
-        buf_append_n(&frame, e->text.p + rows[i].off, rows[i].len);
+        if (busy && cur_row - lo == i) {
+            /* streaming hides the real cursor (agent writes park it at
+             * the content end): paint a block caret at the draft cursor
+             * so mid-turn typing still shows the insertion point */
+            const char *rs = e->text.p + rows[i].off;
+            size_t rlen = rows[i].len;
+            size_t at = 0, w = 0;
+            while (at < rlen && w < cur_col) {
+                uint32_t cp;
+                size_t cl = u8_decode(rs + at, rlen - at, &cp);
+                if (!cl)
+                    cl = 1;
+                w += u8_cp_width(cp);
+                at += cl;
+            }
+            if (at < rlen) {
+                size_t cl = u8_decode(rs + at, rlen - at, &(uint32_t){0});
+                if (!cl)
+                    cl = 1;
+                buf_append_n(&frame, rs, at);
+                buf_appends(&frame, "\x1b[7m");
+                buf_append_n(&frame, rs + at, cl);
+                buf_appends(&frame, "\x1b[27m");
+                buf_append_n(&frame, rs + at + cl, rlen - at - cl);
+            } else if (rlen > 0 && w >= (size_t)g_term_cols) {
+                /* full row: cover the last glyph instead of adding a
+                 * space that would wrap to the next line */
+                size_t last = rlen;
+                while (last > 0 && (rs[last - 1] & 0xC0) == 0x80)
+                    last--;
+                if (last > 0)
+                    last--;
+                buf_append_n(&frame, rs, last);
+                buf_appends(&frame, "\x1b[7m");
+                buf_append_n(&frame, rs + last, rlen - last);
+                buf_appends(&frame, "\x1b[27m");
+            } else {
+                buf_append_n(&frame, rs, rlen);
+                buf_appends(&frame, "\x1b[7m \x1b[27m");
+            }
+        } else {
+            buf_append_n(&frame, e->text.p + rows[i].off, rows[i].len);
+        }
         buf_appends(&frame, "\x1b[0K");
     }
     if (hint) {
@@ -7114,20 +7157,15 @@ static void edit_render(struct editor *e)
     }
     buf_appends(&frame, "\r\n");
     edit_rule_append(&frame);
-    /* the model/ctx status line the REPL used to park at prow+2: the
-     * panel owns everything down to its status row now */
+    /* the pinned status row: same builder the spinner paints with, so a
+     * keystroke repaint never flickers it back to the model name */
     {
-        char line[256];
-        trunc_cols(line, sizeof line,
-                   g_status_model ? g_status_model : "(未设置)",
-                   g_term_cols - 20 > 8 ? g_term_cols - 20 : 8);
-        buf_appends(&frame, "\r\n\x1b[2m");
-    if (g_ctx_tokens > 0)
-        buf_appendf(&frame, "%s · ~%lluk ctx", line,
-                    (unsigned long long)(g_ctx_tokens / 1000));
-    else
+        char line[512], tail[96];
+        status_line_build(line, sizeof line, tail, sizeof tail);
+        buf_appends(&frame, "\r\n");
         buf_appends(&frame, line);
-    buf_appends(&frame, "\x1b[0m\x1b[0K");
+        buf_appends(&frame, tail);
+        buf_appends(&frame, "\x1b[0K");
     }
 
     /* the panel is bottom-pinned: growth and shrink move the top edge,
@@ -7688,6 +7726,8 @@ static enum edit_result edit_line(struct editor *e, char **out)
                 || busy != last_busy) {
                 last_cols = g_term_cols;
                 last_rows = g_term_rows;
+                if (last_busy && !busy)
+                    out_frame_puts("\x1b[?25h"); /* the caret comes home */
                 last_busy = busy;
                 out_frame_printf("\x1b[1;%dr", dock_scroll_bottom());
                 /* the old frame's rows are stale after a reflow: erase
@@ -8373,6 +8413,8 @@ static int run_repl(struct config *cfg)
                     CloseHandle(g_agent_thread);
                     g_agent_thread = NULL;
                 }
+                if (g_emit_vt)
+                    out_frame_puts("\x1b[?25h");
             }
             out_puts("bye\r\n");
             break;
@@ -8860,15 +8902,17 @@ static int queue_pending(void)
 }
 
 /* One agent turn: stream, execute tool calls, feed results back. The
- * cursor stays hidden for the whole turn — streaming repaints the tail
- * every frame, and a visible cursor just jumps around the output. */
+ * real cursor stays hidden for the whole turn — streaming repaints the
+ * tail every frame, and a visible cursor just jumps around the output;
+ * the composer paints a block caret in the draft instead. In dock mode
+ * the editor re-shows the cursor when the turn ends. */
 static int agent_loop(struct config *cfg, struct conversation *cv,
                       struct session_log *slog, const char *system_prompt,
                       int auto_compact)
 {
     int rc = 0;
     if (g_emit_vt)
-        out_puts("\x1b[?25l");
+        out_frame_puts("\x1b[?25l");
     int64_t turn_in = 0, turn_out = 0, turn_cache = 0;
     int turn_usage = 0, turn_has_cache = 0;
     size_t last_request_bytes = 0;
@@ -9141,8 +9185,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     }
     InterlockedExchange(&g_steer, 0); /* a steer aimed at an already-dead run */
     status_repaint(); /* the model name returns to the status row */
-    if (g_emit_vt)
-        out_puts("\x1b[?25h");
+    if (!g_dock && g_emit_vt)
+        out_puts("\x1b[?25h"); /* dock mode: the editor re-shows it */
     return rc;
 }
 
