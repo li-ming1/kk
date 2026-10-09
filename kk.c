@@ -8400,6 +8400,11 @@ static int run_repl(struct config *cfg)
          * scrollback too — a fresh session owns the whole pane. The
          * region itself is owned by edit_render (tracks panel height). */
         out_puts("\x1b[H\x1b[2J\x1b[3J");
+        /* seed the region before the banner so the very first write
+         * bottom-aligns exactly like every later one (idle panel:
+         * 2 rules + 1 draft row + status = 4 rows) */
+        g_region_bottom = g_term_rows - 4;
+        out_frame_printf("\x1b[1;%dr", g_region_bottom);
     }
 
     repl_banner();
