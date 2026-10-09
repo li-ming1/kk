@@ -1543,18 +1543,24 @@ static void status_repaint(void)
     if (!g_emit_vt || !g_dock)
         return;
     AcquireSRWLockExclusive(&g_out_lock);
-    int cr = 0, cc = 0;
-    cursor_abs(&cr, &cc);
+    /* save/restore the cursor in BUFFER coords: a CUP restore would land
+     * somewhere else the moment the pane has scrollback (Top != 0) */
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    memset(&csbi, 0, sizeof csbi);
+    int have_cur = g_console_out
+        && GetConsoleScreenBufferInfo(g_hstdout, &csbi);
+    SHORT cx = have_cur ? csbi.dwCursorPosition.X : 0;
+    SHORT cy = have_cur ? csbi.dwCursorPosition.Y : 0;
     int row = g_term_rows; /* the panel's status row: last on screen */
     char line[512], tail[96];
     status_line_build(line, sizeof line, tail, sizeof tail);
     buf_reset(&g_dock_frame);
     buf_appendf(&g_dock_frame, "\x1b[%d;1H\x1b[2K%s%s\x1b[0K", row, line,
                 tail);
-    if (cr)
-        buf_appendf(&g_dock_frame, "\x1b[%d;%dH", cr, cc);
     if (g_dock_frame.len)
         out_write_unlocked(g_dock_frame.p, g_dock_frame.len);
+    if (have_cur)
+        SetConsoleCursorPosition(g_hstdout, (COORD){cx, cy});
     ReleaseSRWLockExclusive(&g_out_lock);
 }
 
@@ -6835,8 +6841,11 @@ struct editor {
     int saved_valid;
     int home_row;   /* screen row the draft frame starts on (1-based) */
     int drawn_rows; /* rows the last frame occupied: shrink erases them */
-    int content_row; /* transcript end captured at edit start */
-    int content_col; /* the submit echo and post-edit output grow here */
+    int content_x;  /* transcript end as BUFFER coords, captured at edit
+                     * start: exit seeks here with SetConsoleCursorPosition
+                     * (VT rows are viewport-relative and break the moment
+                     * the pane has scrollback or the user scrolls) */
+    int content_y;
     int menu_base;  /* first menu row on screen (menu opens above the panel) */
     int menu_count; /* entries currently drawn */
     int menu_from;  /* sliding window start */
@@ -7634,18 +7643,19 @@ static enum edit_result edit_line(struct editor *e, char **out)
     e->menu_height = 0;
     e->menu_open = 0;
     e->menu_base = 0;
-    /* capture where the transcript ends: the submit echo and everything
-     * after the edit grow from this spot (the panel itself is docked to
-     * the screen bottom, no scroll reservation needed) */
+    /* capture where the transcript ends, in BUFFER coordinates: output
+     * after the edit (command output, the next turn) grows from this
+     * exact spot. VT rows are viewport-relative and unusable here — the
+     * pane usually carries scrollback above the session. */
     {
-        int cr = 0, cc = 0;
-        cursor_abs(&cr, &cc);
-        if (cr < 1 || cr > dock_scroll_bottom())
-            cr = dock_scroll_bottom();
-        if (cc < 1)
-            cc = 1;
-        e->content_row = cr;
-        e->content_col = cc;
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        if (g_console_out && GetConsoleScreenBufferInfo(g_hstdout, &csbi)) {
+            e->content_x = csbi.dwCursorPosition.X;
+            e->content_y = csbi.dwCursorPosition.Y;
+        } else {
+            e->content_x = -1;
+            e->content_y = -1;
+        }
     }
     e->drawn_rows = 0;
     edit_repaint(e);
@@ -7666,10 +7676,6 @@ static enum edit_result edit_line(struct editor *e, char **out)
                 last_cols = g_term_cols;
                 last_rows = g_term_rows;
                 out_printf("\x1b[1;%dr", dock_scroll_bottom());
-                if (e->content_row > dock_scroll_bottom())
-                    e->content_row = dock_scroll_bottom();
-                if (e->content_row < 1)
-                    e->content_row = 1;
                 /* the old frame's rows are stale after a reflow: erase
                  * them before the repaint re-docks the panel */
                 if (e->drawn_rows > 0) {
@@ -7921,18 +7927,11 @@ static enum edit_result edit_line(struct editor *e, char **out)
 
     edit_menu_clear(e);
     out_puts("\x1b[?2004l"); /* bracketed paste off */
-    /* leave: put the cursor back at the content end so command output
-     * and streaming grow from where the transcript left off */
-    {
-        int cr = e->content_row, cc = e->content_col;
-        if (cr > dock_scroll_bottom())
-            cr = dock_scroll_bottom();
-        if (cr < 1)
-            cr = 1;
-        if (cc < 1)
-            cc = 1;
-        out_printf("\x1b[%d;%dH", cr, cc);
-    }
+    /* leave: put the cursor back at the content end (buffer coords) so
+     * command output and streaming grow from where the transcript left */
+    if (e->content_y >= 0)
+        SetConsoleCursorPosition(
+            g_hstdout, (COORD){(SHORT)e->content_x, (SHORT)e->content_y});
     if (result == EDIT_CANCEL)
         out_puts("^C\r\n");
     else if (result == EDIT_EOF)
@@ -8300,6 +8299,12 @@ static int run_repl(struct config *cfg)
         term_size_refresh();
         dock_row = g_term_rows;
         out_printf("\x1b[1;%dr", dock_scroll_bottom());
+        /* the transcript must start at viewport row 1: the scroll region
+         * (DECSTBM) is viewport-relative, so old pane content above the
+         * session would put the content end outside the region and
+         * streaming would plow straight through the panel. 2J keeps the
+         * pane's scrollback, only the visible screen is cleared. */
+        out_puts("\x1b[H\x1b[2J");
     }
 
     repl_banner();
