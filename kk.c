@@ -8601,6 +8601,47 @@ static const char KK_SYSTEM_PROMPT[] =
 
 /* The session-stable system prompt: base text plus the AGENTS.md
  * hierarchy, root-first. Returns a heap string. */
+/* A workspace snapshot: the model otherwise spends a whole round (~3 s and
+ * a full context resend) discovering the tree. fff answers that from a warm
+ * index in well under a millisecond, ranked by what this project opens most.
+ * The listing is capped so a deep tree cannot inflate every later round. */
+#define SNAPSHOT_MAX 2048
+static char *workspace_snapshot(void)
+{
+    if (!fff_ensure())
+        return NULL; /* no index: fall back to the model exploring */
+    struct arena a;
+    arena_init(&a, 512);
+    struct jnode *args = json_parse(&a, "{}", 2);
+    /* an argument-less find is the list mode; it skips p_track, so seeding
+     * the prompt never skews the ranking it reads */
+    char *listing = args ? tool_find(args) : NULL;
+    arena_free(&a);
+    if (!listing || strncmp(listing, "error:", 6) == 0) {
+        free(listing);
+        return NULL;
+    }
+    struct buf b = BUF_INIT;
+    buf_appends(&b,
+                "\n\n# Workspace snapshot\n\n"
+                "Most-touched files here at startup, with sizes and git "
+                "status. Do not spend a round listing the directory: read "
+                "from this, and use find/grep only for what is missing.\n\n");
+    size_t used = 0;
+    for (char *p = listing, *nl; p && *p && used < SNAPSHOT_MAX; p = nl) {
+        nl = strchr(p, '\n');
+        size_t n = nl ? (size_t)(nl - p) : strlen(p);
+        buf_append_n(&b, p, n);
+        buf_appendc(&b, '\n');
+        used += n + 1;
+        if (!nl)
+            break;
+        nl++;
+    }
+    free(listing);
+    return buf_detach(&b);
+}
+
 static char *system_prompt_build(void)
 {
     struct buf b = BUF_INIT;
@@ -8616,6 +8657,11 @@ static char *system_prompt_build(void)
         buf_appends(&b, "\n\n");
         buf_appends(&b, skills);
         free(skills);
+    }
+    char *snap = workspace_snapshot();
+    if (snap) {
+        buf_appends(&b, snap);
+        free(snap);
     }
     return buf_detach(&b);
 }
@@ -8819,9 +8865,10 @@ static int run_repl(struct config *cfg)
     struct editor ed;
     editor_init(&ed);
 
-    /* the system prompt is stable for the session: build once, not per turn
-     * (load_agents_md walks the directory tree every time otherwise) */
-    char *sysp = system_prompt_build();
+    /* the system prompt is stable for the session: build once, not per turn.
+     * Built on first need rather than here, because it waits on fff's warmup
+     * lock — doing it at startup would hold up the banner on a large tree. */
+    char *sysp = NULL;
     for (;;) {
         char *line = NULL;
         enum edit_result er;
@@ -8876,6 +8923,10 @@ static int run_repl(struct config *cfg)
             char *copy = xstrdup(line);
             DA_PUSH(ed.history, copy);
         }
+
+        if (!sysp)
+            sysp = system_prompt_build(); /* first submission: by now fff's
+                                           * warmup has finished on its own */
 
         if ((int)g_busy != 0) {
             /* mid-turn: text steers — it interrupts the run and drives
