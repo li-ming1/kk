@@ -3729,6 +3729,8 @@ struct stream_state {
     size_t request_bytes; /* serialized request size, for the no-usage
                            * compaction estimate */
     char *error; /* heap; set when the API reported an error */
+    int looped;     /* output collapsed into repetition: the stream aborts */
+    size_t loop_next; /* content length at which the next scan is due */
 };
 
 static void stream_state_init(struct stream_state *st)
@@ -3921,11 +3923,53 @@ static void stream_handle_data(struct str data, void *user)
 }
 
 /* Transport bytes -> SSE events -> delta assembly. */
+/* A model that falls into a degenerate loop emits the same span over and
+ * over: one captured run produced 757,988 characters that were 98% one
+ * repeated sentence. Demand that the newest block has already turned up
+ * twice in the recent window, so legitimate repetition (a markdown table,
+ * a progress log) cannot trip it. */
+#define LOOP_BLK 64
+#define LOOP_WIN 8192
+static int content_looping(const struct buf *b)
+{
+    size_t len = b->len;
+    if (len < LOOP_BLK * 3)
+        return 0;
+    const char *tail = b->p + len - LOOP_BLK;
+    const char *p = len > LOOP_WIN ? tail - LOOP_WIN : b->p;
+    if (p < b->p)
+        p = b->p;
+    int hits = 0;
+    for (; p + LOOP_BLK <= tail; p++) {
+        if (*p != tail[0] || memcmp(p, tail, LOOP_BLK) != 0)
+            continue;
+        if (++hits >= 2)
+            return 1;
+        p += LOOP_BLK - 1;
+    }
+    return 0;
+}
+
 static int sse_on_bytes(const char *bytes, size_t n, void *user)
 {
     struct chat_request *cr = user;
     sse_feed(&cr->sse, bytes, n, stream_handle_data, cr);
-    return InterlockedCompareExchange(&g_cancel, 0, 0) ? 1 : 0;
+    if (InterlockedCompareExchange(&g_cancel, 0, 0))
+        return 1;
+    /* scan once per half-kilobyte of new text: the window is small enough
+     * that this is noise next to the network it is watching. Nothing is
+     * examined below 4KB, so a short deliberate repetition stays legal. */
+    struct stream_state *st = cr->st;
+    if (!st->loop_next)
+        st->loop_next = 4096;
+    if (st->content.len >= st->loop_next) {
+        st->loop_next = st->content.len + 512;
+        if (content_looping(&st->content)) {
+            st->looped = 1;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* ==========================================================================
@@ -9509,6 +9553,14 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             out_puts("\r\x1b[0K"); /* erase the wait spinner residue */
         renderer_end_turn(&g_renderer);
 
+            if (st.looped) {
+                /* the repeated text is dropped, not kept: holding it would
+                 * make every later round pay for the loop just broken */
+                out_puts("⚠ 检测到输出重复循环，已中断本轮（该回复未保留）\r\n");
+                stream_state_free(&st);
+                rc = 1;
+                break;
+            }
             if (status == -1) {
                 if (InterlockedCompareExchange(&g_steer, 0, 0)) {
                     /* enter steer: the new text becomes the user turn
