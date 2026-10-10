@@ -8688,10 +8688,13 @@ static const char KK_SYSTEM_PROMPT[] =
     "filters by file) when the path is unknown, read before "
     "changing anything, change files with the write tool (pass old_string "
     "for precise replacements, copying text exactly from the read output), "
-    "and verify changes by running commands with the bash tool. Issue "
-    "independent tool calls (several reads, greps or finds) together in "
-    "one round instead of one call per round — every round costs "
-    "seconds. Keep answers short and factual.";
+    "and verify changes by running commands with the bash tool. Batch "
+    "ruthlessly: decide everything you need before acting and emit it as "
+    "ONE round of parallel calls — 3 or more calls per round is the norm "
+    "and a single call in a round is a defect, because every extra round "
+    "re-sends the whole context and costs seconds. Split into another "
+    "round only when a call's arguments need an earlier call's result. "
+    "Keep answers short and factual";
 
 /* The session-stable system prompt: base text plus the AGENTS.md
  * hierarchy, root-first. Returns a heap string. */
