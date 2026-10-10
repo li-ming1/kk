@@ -7137,6 +7137,7 @@ static void skill_describe(const char *dir, const char *dname, struct buf *out,
     char *end = strstr(fm + 3, "\n---");
     if (!end)
         goto done_file; /* unterminated frontmatter: not worth guessing */
+    *end = '\0'; /* bound the key scan: fm_value must not read into the body */
 
     char *name = fm_value(fm, "name");
     char *desc = fm_value(fm, "description");
