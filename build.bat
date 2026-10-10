@@ -11,5 +11,7 @@ if not exist "%VSD%" (
 call "%VSD%" -arch=x64 -no_logo
 if errorlevel 1 exit /b 1
 cl /nologo /std:c11 /W4 /O2 /GL /MT /Zi /utf-8 kk.c ^
-    /link /LTCG /OUT:kk.exe /MANIFEST:EMBED /MANIFESTINPUT:kk.manifest ^
+    /link /LTCG /MAP /OUT:kk.exe /MANIFEST:EMBED /MANIFESTINPUT:kk.manifest ^
     winhttp.lib user32.lib
+rem /MAP writes kk.map (RVA -> symbol): kk_crash.txt records RVAs, and kk.map
+rem is what names them without a debugger.

@@ -32,7 +32,6 @@
 #define NOCRYPT
 #include <windows.h>
 #include <winhttp.h>
-#include <dbghelp.h>
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -10165,42 +10164,59 @@ static int run_prompt(struct config *cfg, const char *prompt, int cont)
     return rc;
 }
 
-/* --- crash diagnostics: minidump on unhandled exception ------------------ */
-/* A crash mid-turn used to vanish silently; the dump (next to the exe,
- * analyzed against kk.pdb) names the faulting function and line. */
+/* --- crash diagnostics: a text scene of the fault ------------------------ */
+/* A crash must leave something behind. MiniDumpWriteDump cannot do it on
+ * this machine: measured with a standalone probe it returns
+ * ERROR_INVALID_PARAMETER (0x80070057) for every argument variant — with or
+ * without exception info, ClientPointers 0/1, ThreadId 0,
+ * MiniDumpWithHandleData, a real OpenProcess handle instead of the pseudo
+ * one — and it fails the same way from a healthy process, so the promised
+ * .dmp was always 0 bytes. What has no such dependency is our own stack:
+ * this writes the exception code, the address touched, the faulting
+ * instruction and the return addresses as RVAs, which kk.pdb names offline.
+ * Static buffers and one WriteFile each: the allocator may be what died, and
+ * a handler runs on whatever stack is left. */
 static LONG WINAPI kk_crash_filter(EXCEPTION_POINTERS *ep)
 {
-    HANDLE f = CreateFileA("kk_crash.dmp", GENERIC_WRITE, 0, NULL,
+    static char rec[512];
+    static void *frames[16];
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    size_t img = 0;
+    if (base) { /* our own headers are mapped and readable */
+        const IMAGE_DOS_HEADER *dh = (const IMAGE_DOS_HEADER *)base;
+        const IMAGE_NT_HEADERS *nt =
+            (const IMAGE_NT_HEADERS *)(base + (ptrdiff_t)dh->e_lfanew);
+        img = (size_t)nt->OptionalHeader.SizeOfImage;
+    }
+    ULONG n = RtlCaptureStackBackTrace(0, 16, frames, NULL);
+    int len = snprintf(rec, sizeof rec,
+                       "kk crash code=0x%08lX rip=+%llX fault=%llX\n",
+                       (unsigned long)er->ExceptionCode,
+                       (unsigned long long)((uintptr_t)er->ExceptionAddress -
+                                            base),
+                       er->NumberParameters > 1
+                           ? (unsigned long long)er->ExceptionInformation[1]
+                           : 0ULL);
+    for (ULONG i = 0; i < n && len < (int)sizeof rec - 24; i++) {
+        uintptr_t a = (uintptr_t)frames[i];
+        if (a >= base && a - base < img)
+            len += snprintf(rec + len, sizeof rec - len, " +%llX",
+                            (unsigned long long)(a - base));
+        else
+            len += snprintf(rec + len, sizeof rec - len, " sys%llX",
+                            (unsigned long long)a);
+    }
+    snprintf(rec + len, sizeof rec - len, "\n");
+    DWORD wr = 0;
+    HANDLE f = CreateFileA("kk_crash.txt", GENERIC_WRITE, 0, NULL,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f != INVALID_HANDLE_VALUE) {
-        MINIDUMP_EXCEPTION_INFORMATION mei = { GetCurrentThreadId(), ep, 0 };
-        BOOL (WINAPI *pMiniDump)(HANDLE, HANDLE, DWORD, MINIDUMP_TYPE,
-                                 PMINIDUMP_EXCEPTION_INFORMATION,
-                                 PMINIDUMP_USER_STREAM_INFORMATION,
-                                 PMINIDUMP_CALLBACK_INFORMATION) = NULL;
-        HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-        if (dbghelp)
-            pMiniDump = (BOOL (WINAPI *)(HANDLE, HANDLE, DWORD, MINIDUMP_TYPE,
-                                         PMINIDUMP_EXCEPTION_INFORMATION,
-                                         PMINIDUMP_USER_STREAM_INFORMATION,
-                                         PMINIDUMP_CALLBACK_INFORMATION))
-                GetProcAddress(dbghelp, "MiniDumpWriteDump");
-        if (pMiniDump)
-            pMiniDump(GetCurrentProcess(), f, GetCurrentProcessId(),
-                      MiniDumpNormal, &mei, NULL, NULL);
+        WriteFile(f, rec, (DWORD)strlen(rec), &wr, NULL);
         CloseHandle(f);
     }
-    /* the dump is the expensive answer and it can come out empty (a wedged
-     * pipe, a stack overflow); the code plus address names the fault on
-     * their own once kk.pdb is at hand */
-    char msg[128];
-    int n = snprintf(msg, sizeof msg,
-                      "\r\nkk crashed: code 0x%08lX at %p%s\r\n",
-                      (unsigned long)ep->ExceptionRecord->ExceptionCode,
-                      ep->ExceptionRecord->ExceptionAddress,
-                      f != INVALID_HANDLE_VALUE ? " (kk_crash.dmp)" : "");
-    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, (DWORD)n, &(DWORD){0},
-              NULL);
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), rec, (DWORD)strlen(rec),
+              &(DWORD){0}, NULL);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
