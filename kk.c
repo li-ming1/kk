@@ -9242,6 +9242,27 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
 
     char *err_body = NULL;
     st->request_bytes = body.len;
+    /* KK_DUMP_REQ=<path>: write the exact bytes we are about to send. The
+     * session log records messages, not the serialized request, so a gap
+     * between `req` and the sum of the logged messages cannot be closed
+     * without this. Overwrites: the file is always the current request. */
+    {
+        static char *dump_path;
+        static int dumped_probe;
+        if (!dumped_probe) {
+            dumped_probe = 1;
+            dump_path = env_get("KK_DUMP_REQ");
+        }
+        if (dump_path && *dump_path) {
+            HANDLE h = CreateFileA(dump_path, GENERIC_WRITE, 0, NULL,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h != INVALID_HANDLE_VALUE) {
+                DWORD wr;
+                WriteFile(h, body.p, (DWORD)body.len, &wr, NULL);
+                CloseHandle(h);
+            }
+        }
+    }
     /* prefix-cache diagnostics: how much of this request repeats the
      * previous one byte-for-byte from the very first byte. A small `shared`
      * on a big body is our own instability; a big `shared` with
@@ -10119,8 +10140,12 @@ static const char KK_HELP[] =
     "  -c, --continue      继续最近一次会话\r\n"
     "  --base URL          API 地址（环境变量 KK_BASE_URL）\r\n"
     "  --key KEY           API 密钥（环境变量 KK_API_KEY）\r\n"
-    "  --model MODEL       模型 id（环境变量 KK_MODEL）\r\n"    "  --version, --help\r\n"
-    "不带参数启动交互式 REPL。\r\n";
+    "  --model MODEL       模型 id（环境变量 KK_MODEL）\r\n"
+    "  --version, --help\r\n"
+    "不带参数启动交互式 REPL。\r\n"
+    "环境变量：KK_MAX_OUTPUT_TOKENS 输出上限、KK_CONTEXT_WINDOW 假定窗口、\r\n"
+    "  KK_DUMP_REQ=<路径> 把每次发出的请求体覆盖写到该文件（查「这轮为什么\r\n"
+    "  比日志里的消息大」），KK_FORCE_CONSOLE 重定向下仍按 VT 输出（测试用）。\r\n";
 
 static void config_print_missing(const struct config *cfg)
 {
