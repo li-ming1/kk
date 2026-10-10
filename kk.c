@@ -8711,8 +8711,20 @@ static char *workspace_snapshot(void)
         return NULL;
     }
     struct buf b = BUF_INIT;
+    buf_appends(&b, "\n\n# Workspace snapshot\n\n");
+    /* The listing is relative and nothing else in the prompt says where the
+     * agent is, so a model that wants an absolute path invents one: a real
+     * run read C:\code\test2\help.md — a directory that does not exist on
+     * this machine — and spent the next whole round (2,895 input tokens)
+     * discovering its own working directory. */
+    char cwd[MAX_PATH];
+    if (GetCurrentDirectoryA(MAX_PATH, cwd))
+        buf_appendf(&b,
+                    "Working directory: %s\n"
+                    "Pass paths relative to it, exactly as listed below: never "
+                    "prefix a directory you invented.\n\n",
+                    cwd);
     buf_appends(&b,
-                "\n\n# Workspace snapshot\n\n"
                 "Most-touched files here at startup, with sizes and git "
                 "status. Do not spend a round listing the directory: read "
                 "from this, and use find/grep only for what is missing.\n\n");
