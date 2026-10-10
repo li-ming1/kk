@@ -8571,8 +8571,10 @@ static int session_pick(char *path, size_t cap)
     DWORD saved;
     /* raw VT bytes like the composer: Ctrl+C lands as a key (cancel),
      * QuickEdit stays on for mouse selection */
-    if (!term_raw_begin(&saved))
+    if (!term_raw_begin(&saved)) {
+        free(rows);
         return 0;
+    }
 
     int sel = 0, from = 0;
     int list_rows = g_term_rows - 4;
