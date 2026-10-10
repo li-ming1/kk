@@ -1288,7 +1288,7 @@ static unsigned char csi_read(char *params, size_t cap, size_t *np)
  * UTF-8 output codepage), redirect writes through WriteFile. The lock
  * keeps the wait-spinner thread from interleaving with stream paint. */
 static SRWLOCK g_out_lock = SRWLOCK_INIT;
-static volatile LONG g_busy;    /* 0 idle, 1 waiting for first stream byte */
+static volatile LONG g_busy;    /* 0 idle, 1 waiting, 2 generating */
 static int g_dock;              /* REPL dock active: pin composer during turns */
 /* Shared with the spinner thread: g_status_model is only ever written
  * while no turn runs (cmd_slash executes idle), g_ctx_tokens updates
@@ -6516,8 +6516,8 @@ static void session_log_usage(struct session_log *sl, int64_t prompt,
 }
 
 /* Record a compaction. The log stays append-only: loaders replay the
- * replacement (truncate to keep, re-add the summary) so --continue sees
- * exactly the view the model sees. */
+ * replacement (drop the head down to keep, re-add the summary) so
+ * --continue sees exactly the view the model sees. */
 static void session_log_compact(struct session_log *sl, size_t keep,
                                 const char *summary)
 {
@@ -9114,12 +9114,6 @@ static char *api_error_message(const char *body)
     return out;
 }
 
-/* Hard ceiling on what one response may generate. Without it a degenerate
- * repetition loop bills unbounded output and then sits in the session log
- * forever: one captured run put 757,988 characters (~190k tokens, 98% of it
- * the same sentence repeated) into a single assistant message. The default
- * keeps ~3x headroom over writing a 40KB file, whose content also counts as
- * output. */
 /* Decimal digits at *pp, advancing past them (an empty run parses to 0). */
 static int64_t str_to_i64(const char **pp)
 {
@@ -9129,6 +9123,12 @@ static int64_t str_to_i64(const char **pp)
     return v;
 }
 
+/* Hard ceiling on what one response may generate. Without it a degenerate
+ * repetition loop bills unbounded output and then sits in the session log
+ * forever: one captured run put 757,988 characters (~190k tokens, 98% of it
+ * the same sentence repeated) into a single assistant message. The default
+ * keeps ~3x headroom over writing a 40KB file, whose content also counts as
+ * output. */
 static int64_t max_output_tokens(void)
 {
     static int64_t cached;
