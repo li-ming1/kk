@@ -2907,7 +2907,7 @@ static void tbl_cell_sgr(struct buf *out, const struct inline_state *st,
     compose_sgr(seq, sizeof seq, "", st);
     if (!*have || strcmp(seq, last) != 0) {
         buf_appends(out, seq);
-        snprintf(last, sizeof last, "%s", seq);
+        memcpy(last, seq, strlen(seq) + 1); /* last is the caller's char[56] */
         *have = 1;
     }
 }
