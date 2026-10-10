@@ -1532,21 +1532,20 @@ static void status_line_build(char *line, size_t lcap, char *tail,
 {
     int busy = (int)g_busy;
     tail[0] = '\0';
-    if (busy == 1) {
-        if (InterlockedCompareExchange(&g_cancel, 0, 0))
-            snprintf(line, lcap,
-                     "\x1b[36m⇣\x1b[0m \x1b[36m正在取消…\x1b[0m");
-        else
-            snprintf(line, lcap,
-                     "\x1b[36m%s\x1b[0m \x1b[36m思考中\x1b[0m"
-                     "\x1b[2m · Ctrl+C 中断\x1b[0m",
-                     SPIN_FRAMES[g_frame % 10]);
+    if (busy == 1 && InterlockedCompareExchange(&g_cancel, 0, 0)) {
+        snprintf(line, lcap,
+                 "\x1b[36m⇣\x1b[0m \x1b[36m正在取消…\x1b[0m");
     } else if (g_tick_label[0]) {
         char label[160];
         trunc_cols(label, sizeof label, g_tick_label,
                    g_term_cols - 40 > 8 ? g_term_cols - 40 : 8);
         snprintf(line, lcap, "\x1b[36m%s\x1b[0m \x1b[2m%s\x1b[0m",
                  SPIN_FRAMES[g_frame % 10], label);
+    } else if (busy == 1) {
+        snprintf(line, lcap,
+                 "\x1b[36m%s\x1b[0m \x1b[36m思考中\x1b[0m"
+                 "\x1b[2m · Ctrl+C 中断\x1b[0m",
+                 SPIN_FRAMES[g_frame % 10]);
     } else if (busy == 2) {
         const char *spin = SPIN_FRAMES[g_frame % 10];
         if (g_stream_bytes) {
@@ -1575,6 +1574,39 @@ static void status_line_build(char *line, size_t lcap, char *tail,
         fmt_secs(fs, sizeof fs, (GetTickCount() - since) / 1000);
         snprintf(tail, tcap, "\x1b[2m · %s\x1b[0m", fs);
     }
+}
+
+/* Progress of the tool-call arguments the model is streaming right now.
+ * A big write can spend minutes generating its content before the tool ever
+ * runs, and until now the status row said only "思考中" the whole time. */
+static char g_gen_tool[48];
+static size_t g_gen_len, g_gen_lines;
+
+static void gen_progress_reset(void)
+{
+    g_gen_tool[0] = '\0';
+    g_gen_len = 0;
+    g_gen_lines = 0;
+}
+
+/* args holds the whole accumulated buffer; from is where this delta began,
+ * so line counting stays O(new bytes) instead of rescanning per delta. */
+static void gen_progress(const char *tool, const struct buf *args, size_t from)
+{
+    if (g_gen_len == 0 && g_gen_lines == 0 && args->len > from)
+        g_tick_start = GetTickCount(); /* first fragment: start the clock */
+    for (const char *p = args->p + from; p < args->p + args->len; p++)
+        if (*p == '\n')
+            g_gen_lines++;
+    g_gen_len += args->len - from;
+    char fb[24];
+    fmt_bytes(fb, sizeof fb, (unsigned long long)g_gen_len);
+    AcquireSRWLockExclusive(&g_out_lock);
+    if (!g_gen_tool[0] && tool && *tool)
+        snprintf(g_gen_tool, sizeof g_gen_tool, "%s", tool);
+    snprintf(g_tick_label, sizeof g_tick_label, "%s · 生成中 %s / %zu 行",
+             g_gen_tool[0] ? g_gen_tool : "工具", fb, g_gen_lines);
+    ReleaseSRWLockExclusive(&g_out_lock);
 }
 
 /* The status line: spinner + phase during waits, live counters while
@@ -3915,8 +3947,11 @@ static void stream_handle_data(struct str data, void *user)
                     call->name = jstr_dupz(name);
                 }
                 struct jnode *args = jobj_get(fn, "arguments");
-                if (args && args->tag == J_STR && args->raw.n > 0)
+                if (args && args->tag == J_STR && args->raw.n > 0) {
+                    size_t at = call->args.len;
                     jdecode_str(args->raw, &call->args);
+                    gen_progress(call->name, &call->args, at);
+                }
             }
         }
     }
@@ -9550,6 +9585,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         InterlockedExchange(&g_cancel, 0);
         InterlockedExchange(&g_painted, 0);
         g_stream_bytes = 0;
+        gen_progress_reset();
+        g_tick_label[0] = '\0'; /* a cancelled round may have left progress */
         /* race safety: input that landed as the last round ended (too
          * late to interrupt) joins this request without interrupting */
         turn_feed_queue(cv, slog);
@@ -9670,6 +9707,9 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                               st.cache_tokens, st.has_cache);
         }
         if (st.finish != FINISH_TOOL_CALLS || st.n_calls == 0) {
+            /* no tool will run, so nothing will clear the generation
+             * progress the way the tool loop does below */
+            g_tick_label[0] = '\0';
             if (st.content.len) {
                 struct message *m = conv_add_take(cv, "assistant",
                                                   buf_detach(&st.content));
