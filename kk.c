@@ -9406,6 +9406,58 @@ static int conv_stub_tool_results(struct conversation *cv, size_t *freed)
                n, bytes);
     return 1;
 }
+/* Routine recycling, run before every request: a tool result the model has
+ * already had two rounds to use is re-paid forever otherwise. Corpus
+ * numbers: re-sent history is 26x the generated text, one 49-round turn paid
+ * 1.0M tokens mostly from 20-60KB read results it stopped looking at. The
+ * two-round slack guarantees the model never loses output it has not seen,
+ * and anything recycled is one call away from being fetched back.
+ * `min_rounds` counts assistant messages after the result — every one of
+ * them is a request that already carried it; `min_bytes` skips results too
+ * small to be worth a re-run. */
+static int conv_recycle_tool_results(struct conversation *cv, size_t *freed,
+                                     size_t min_bytes, size_t min_rounds)
+{
+    size_t rounds = 0; /* sightings so far walking back from the tail */
+    int n = 0;
+    size_t bytes = 0;
+    for (size_t i = cv->msgs.n; i > 0; i--) {
+        struct message *m = &cv->msgs.p[i - 1];
+        if (strcmp(m->role, "assistant") == 0) {
+            rounds++;
+            continue;
+        }
+        if (strcmp(m->role, "tool") != 0 || !m->content)
+            continue;
+        if (rounds < min_rounds)
+            continue;
+        size_t len = strlen(m->content);
+        if (len <= min_bytes)
+            continue;
+        free(m->content);
+        m->content = xasprintf("[tool output recycled: %zu bytes — re-run "
+                               "the call above to fetch it again]", len);
+        free(m->json_cache); /* the cached fragment still holds the full
+                              * output: it must go with the content */
+        m->json_cache = NULL;
+        bytes += len;
+        n++;
+    }
+    if (!n)
+        return 0;
+    if (freed)
+        *freed = bytes;
+    if (bytes >= 8192) /* per-round aging recycles a bit every round: only
+                        * a real saving is worth a line on screen */
+        out_printf("♻ %d 条较早的工具输出（共 %zu 字节）换成占位，"
+                   "重跑调用即可取回\r\n", n, bytes);
+    return 1;
+}
+
+/* Bulky tool results worth recycling, and how many rounds the model gets
+ * to use them first. Sizes are bytes; tokens are roughly half. */
+#define TOOL_STUB_MIN 2048
+#define TOOL_KEEP_ROUNDS 2
 
 /* Fold everything before the most recent user turn into one summary
  * message. display == model view: the summary is printed exactly as the
@@ -9635,6 +9687,13 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     /* no round cap, like pi: the loop runs until the model stops calling
      * tools; Ctrl+C is the escape hatch */
     for (;;) {
+        /* recycle before EVERY request, not just before every turn: a long
+         * tool loop is one turn, and waiting for it to end re-pays every
+         * early result for the whole loop. The two-round slack means the
+         * model has already seen anything this drops. */
+        if (auto_compact)
+            conv_recycle_tool_results(cv, NULL, TOOL_STUB_MIN,
+                                      TOOL_KEEP_ROUNDS);
         renderer_init(&g_renderer);
         renderer_set_width(&g_renderer);
         struct stream_state st;
