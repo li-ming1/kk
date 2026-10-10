@@ -9493,7 +9493,9 @@ static int conv_compact(struct config *cfg, struct conversation *cv,
     conv_drop_head(cv, cut);
     conv_prepend_user(cv, buf_detach(&wire));
     struct message *sm = &cv->msgs.p[0];
-    session_log_compact(slog, cv->msgs.n - 1, st.content.p);
+    /* log the prefixed content: the live model view is prefix+summary, and
+     * --continue must restore exactly that, not the bare summary */
+    session_log_compact(slog, cv->msgs.n - 1, sm->content);
     stream_state_free(&st);
 
     out_printf("⋯ 上下文已压缩：前 %zu 条消息折叠为摘要，保留最近 %zu 条\r\n",
