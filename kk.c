@@ -8731,27 +8731,57 @@ static char *workspace_snapshot(void)
     return buf_detach(&b);
 }
 
-static char *system_prompt_build(void)
+/* Every round re-pays the static head, and nothing used to add it up: one
+ * project's AGENTS.md measured 22.9KB ≈ 6.8k tokens per round, more than
+ * anything the recycling and cache work moves. Sizes are what actually got
+ * appended (section headers included), pre-escape; the wire adds a few
+ * percent. Printed once per interactive session, right where the prompt is
+ * first built, so the number lands before the round that pays it. */
+#define HEAD_BYTES_PER_TOKEN 3.4 /* median req / prompt_tokens over logs */
+static const struct buf *tools_json_block(void);
+static void head_report(size_t agents, size_t skills, size_t snap)
+{
+    size_t base = sizeof(KK_SYSTEM_PROMPT) - 1;
+    size_t tools = tools_json_block()->len;
+    size_t head = base + agents + skills + snap + tools;
+    char line[224];
+    snprintf(line, sizeof line,
+             "静态头 %.1fKB ≈ %.1fk token/轮 · tools %.1f + AGENTS.md %.1f + "
+             "基础 %.1f + skills %.1f + 快照 %.1f",
+             head / 1024.0, head / (HEAD_BYTES_PER_TOKEN * 1024.0),
+             tools / 1024.0, agents / 1024.0, base / 1024.0, skills / 1024.0,
+             snap / 1024.0);
+    out_printf(vt_or("\x1b[2m%s\x1b[0m\r\n", "%s\r\n"), line);
+}
+
+static char *system_prompt_build(int report)
 {
     struct buf b = BUF_INIT;
     buf_appends(&b, KK_SYSTEM_PROMPT);
+    size_t from = b.len; /* each section's bytes are the next b.len - from */
     char *agents = load_agents_md();
     if (agents) {
         buf_appends(&b, "\n\n# Project instructions (AGENTS.md)\n");
         buf_appends(&b, agents);
         free(agents);
     }
+    size_t agents_n = b.len - from;
+    from = b.len;
     char *skills = load_skills();
     if (skills) {
         buf_appends(&b, "\n\n");
         buf_appends(&b, skills);
         free(skills);
     }
+    size_t skills_n = b.len - from;
+    from = b.len;
     char *snap = workspace_snapshot();
     if (snap) {
         buf_appends(&b, snap);
         free(snap);
     }
+    if (report)
+        head_report(agents_n, skills_n, b.len - from);
     return buf_detach(&b);
 }
 
@@ -9010,7 +9040,7 @@ static int run_repl(struct config *cfg)
         }
 
         if (!sysp)
-            sysp = system_prompt_build(); /* first submission: by now fff's
+            sysp = system_prompt_build(1); /* first submission: by now fff's
                                            * warmup has finished on its own */
 
         if ((int)g_busy != 0) {
@@ -9157,6 +9187,29 @@ static int64_t max_output_tokens(void)
     return cached;
 }
 
+/* The serialized `tools` array: a compile-time constant, escaped once. Also
+ * read by the startup head report — every round pays this bytes-per-request. */
+static const struct buf *tools_json_block(void)
+{
+    static struct buf b;
+    if (!b.len) {
+        for (size_t ti = 0; ti < KK_N_TOOLS; ti++) {
+            if (ti)
+                buf_appends(&b, ",");
+            buf_appends(&b, "{\"type\":\"function\",\"function\":{\"name\":\"");
+            buf_appends(&b, KK_TOOLS[ti].name);
+            buf_appends(&b, "\",\"description\":\"");
+            json_escape_append(&b, KK_TOOLS[ti].description,
+                               strlen(KK_TOOLS[ti].description));
+            buf_appends(&b,
+                        "\",\"parameters\":{\"type\":\"object\",\"properties\":");
+            buf_appends(&b, KK_TOOLS[ti].params);
+            buf_appends(&b, "}}}");
+        }
+    }
+    return &b;
+}
+
 /* One model round-trip: POST and stream into hooks. Returns HTTP status,
  * 0 on a transport error, or -1 when cancelled. st carries the result.
  * (cv is non-const: serialization caches fragments on the messages.) */
@@ -9173,31 +9226,14 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
     buf_appends(&body, "{\"model\":\"");
     json_escape_append(&body, cfg->model, strlen(cfg->model));
     if (with_tools) {
-        /* The tool schema block is a compile-time constant: escape once.
-         * It sits AHEAD of `messages` on purpose. Prompt caching is a
-         * *prefix* cache, and every round appends inside the messages
-         * array: last in the body these 4.7KB of unchanging text could
-         * never fall inside a shared prefix. JSON key order carries no
-         * meaning for the API, only for the byte-level prefix. */
-        static struct buf tools_json;
-        if (!tools_json.len) {
-            for (size_t ti = 0; ti < KK_N_TOOLS; ti++) {
-                if (ti)
-                    buf_appends(&tools_json, ",");
-                buf_appends(&tools_json,
-                            "{\"type\":\"function\",\"function\":{\"name\":\"");
-                buf_appends(&tools_json, KK_TOOLS[ti].name);
-                buf_appends(&tools_json, "\",\"description\":\"");
-                json_escape_append(&tools_json, KK_TOOLS[ti].description,
-                                   strlen(KK_TOOLS[ti].description));
-                buf_appends(&tools_json,
-                            "\",\"parameters\":{\"type\":\"object\",\"properties\":");
-                buf_appends(&tools_json, KK_TOOLS[ti].params);
-                buf_appends(&tools_json, "}}}");
-            }
-        }
+        /* The tool schema block sits AHEAD of `messages` on purpose. Prompt
+         * caching is a *prefix* cache, and every round appends inside the
+         * messages array: last in the body these kilobytes of unchanging
+         * text could never fall inside a shared prefix. JSON key order
+         * carries no meaning for the API, only for the byte-level prefix. */
+        const struct buf *tj = tools_json_block();
         buf_appends(&body, "\",\"tools\":[");
-        buf_append_n(&body, tools_json.p, tools_json.len);
+        buf_append_n(&body, tj->p, tj->len);
     }
     buf_appends(&body, with_tools ? "],\"messages\":[" : "\",\"messages\":[");
     int first = 1;
@@ -10178,8 +10214,9 @@ static int run_prompt(struct config *cfg, const char *prompt, int cont)
     }
 
     /* one-shot mode sees the same system prompt as the REPL: the AGENTS.md
-     * hierarchy applies to every request, not just interactive ones */
-    char *sysp = system_prompt_build();
+     * hierarchy applies to every request, not just interactive ones. No head
+     * report: -p's stdout is the answer, not a status surface. */
+    char *sysp = system_prompt_build(0);
 
     int rc = agent_loop(cfg, &cv, &slog, sysp, 0);
 
