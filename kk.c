@@ -1189,18 +1189,6 @@ static void term_init(void)
     SetConsoleCtrlHandler(kk_ctrl_handler, TRUE);
 }
 
-/* The cursor's 1-based row within the visible window, or -1. */
-/* The cursor's 1-based row/column in the visible window, or 0/0. */
-static void cursor_abs(int *row, int *col)
-{
-    *row = *col = 0;
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    if (!g_console_out || !GetConsoleScreenBufferInfo(g_hstdout, &csbi))
-        return;
-    *row = (int)(csbi.dwCursorPosition.Y - csbi.srWindow.Top) + 1;
-    *col = (int)(csbi.dwCursorPosition.X - csbi.srWindow.Left) + 1;
-}
-
 /* --- raw VT byte input (ki's scheme) ------------------------------------ */
 
 /* Input is read as the terminal's raw VT byte stream (ReadFile +
@@ -1605,13 +1593,6 @@ static void status_line_build(char *line, size_t lcap, char *tail,
 static char g_gen_tool[48];
 static size_t g_gen_len, g_gen_lines;
 
-static void gen_progress_reset(void)
-{
-    g_gen_tool[0] = '\0';
-    g_gen_len = 0;
-    g_gen_lines = 0;
-}
-
 /* args holds the whole accumulated buffer; from is where this delta began,
  * so line counting stays O(new bytes) instead of rescanning per delta. */
 static void gen_progress(const char *tool, const struct buf *args, size_t from)
@@ -1704,18 +1685,20 @@ static void user_bars_buf(struct buf *out, const char *text, size_t len)
 }
 
 /* Echo a pending line as the user turn it becomes (same shape the
- * composer draws). Runs on whichever thread feeds the conversation;
- * out_write seeks to the content end on the agent thread. */
-static void user_line_show(const char *text)
+ * composer draws). Takes the line as a slice: callers hold it inside a
+ * larger NUL-terminated buffer and must not pay a copy per line.
+ * Runs on whichever thread feeds the conversation; out_write seeks to
+ * the content end on the agent thread. */
+static void user_line_show(const char *text, size_t n)
 {
     if (g_emit_vt) {
         struct buf b = BUF_INIT;
-        user_bars_buf(&b, text, strlen(text));
+        user_bars_buf(&b, text, n);
         buf_appends(&b, "\r\n");
         out_write(b.p, b.len);
         buf_free(&b);
     } else {
-        out_printf("> %s\r\n", text);
+        out_printf("> %.*s\r\n", (int)n, text);
     }
 }
 
@@ -3043,11 +3026,6 @@ static void tbl_cell_render(struct tbl_cell *c, const char *s, size_t n, int bol
     c->width = (int)visible_width(c->bytes.p, c->bytes.len);
 }
 
-static void tbl_cell_clear(struct tbl_cell *c)
-{
-    buf_free(&c->bytes);
-}
-
 static void tbl_sep_emit(struct buf *line)
 {
     buf_appendc(line, ' ');
@@ -3266,7 +3244,7 @@ static void tbl_finalize(struct renderer *r)
 
     for (int row = 0; row < nrows; row++)
         for (int j = 0; j < ncols; j++)
-            tbl_cell_clear(&grid[(size_t)row * ncols + j]);
+            buf_free(&grid[(size_t)row * ncols + j].bytes);
     free(grid);
     buf_reset(tb);
 }
@@ -3699,11 +3677,6 @@ struct sse_parser {
     struct buf data;  /* data: lines of the current event, \n-joined */
     int have_data;
 };
-
-static void sse_parser_init(struct sse_parser *sp)
-{
-    memset(sp, 0, sizeof *sp);
-}
 
 static void sse_parser_free(struct sse_parser *sp)
 {
@@ -4835,25 +4808,6 @@ static void buf_append_line_capped(struct buf *out, const char *s, size_t n)
     buf_appendc(out, '\n');
 }
 
-/* Shared find/grep prologue: a query arg plus a ready fff index. Returns
- * an error string to hand back, or NULL with *query set (caller frees). */
-static char *fff_query(const struct jnode *args, const char *what,
-                       char **query)
-{
-    *query = jstr_dupz(jobj_get(args, "query"));
-    if (!*query || !**query) {
-        free(*query);
-        *query = NULL;
-        return xasprintf("error: %s requires a query", what);
-    }
-    if (!fff_ensure()) {
-        free(*query);
-        *query = NULL;
-        return xstrdup("error: 文件索引不可用（fff DLL 未随 kk.exe 提供）");
-    }
-    return NULL;
-}
-
 static char *tool_find(const struct jnode *args)
 {
     char *query = jstr_dupz(jobj_get(args, "query"));
@@ -4938,10 +4892,15 @@ static void grep_context_line(struct buf *out, const char *text)
 
 static char *tool_grep(const struct jnode *args)
 {
-    char *query;
-    char *err = fff_query(args, "grep", &query);
-    if (err)
-        return err;
+    char *query = jstr_dupz(jobj_get(args, "query"));
+    if (!query || !*query) {
+        free(query);
+        return xstrdup("error: grep requires a query");
+    }
+    if (!fff_ensure()) {
+        free(query);
+        return xstrdup("error: 文件索引不可用（fff DLL 未随 kk.exe 提供）");
+    }
     struct jnode *rx = jobj_get(args, "regex");
     int mode = rx && rx->tag == J_TRUE ? 1 : 0; /* 0 plain SIMD, 1 regex */
     int64_t off = args_int(args, "offset", 0);
@@ -6058,17 +6017,16 @@ static int shell_run(struct str command,
         char *wire = xasprintf("%s\r\n", b64);
         free(b64);
 
-        struct buf out = BUF_INIT;
         DWORD wrote = 0;
         int sent = WriteFile(g_ps_stdin_w, wire, (DWORD)strlen(wire), &wrote,
                              NULL);
         free(wire);
         if (!sent) {
             /* the session died since the last call; respawn and resend */
-            buf_free(&out);
             ps_kill();
             continue;
         }
+        struct buf out = BUF_INIT;
 
         /* read until the marker, EOF, or the deadline; output of the
          * call and of the trailing marker line interleave in one pipe.
@@ -6974,9 +6932,7 @@ static void conv_replay(struct conversation *cv)
             while (*s) {
                 char *nl = strchr(s, '\n');
                 size_t n = nl ? (size_t)(nl - s) : strlen(s);
-                char *line = xstrndup(s, n);
-                user_line_show(line);
-                free(line);
+                user_line_show(s, n);
                 s += n + (nl ? 1 : 0);
             }
         } else if (strcmp(m->role, "assistant") == 0) {
@@ -7558,8 +7514,10 @@ static int edit_cursor_ctl_at(const struct editor *e, size_t cur_col,
                     e->home_row + 1 + cur_row - lo, ctl_col);
 }
 
-/* Compose the cursor-positioning escape for e->cur into ctl. */
-static int edit_cursor_ctl(const struct editor *e, char *ctl, size_t cap)
+/* Seek the console cursor without rewriting the line: pure cursor moves
+ * leave the text pixels intact, so O(line) console traffic per keypress
+ * buys nothing. */
+static void edit_cursor_pos(struct editor *e)
 {
     size_t cols = (size_t)g_term_cols;
     size_t br = 0, bc = 0;
@@ -7567,17 +7525,9 @@ static int edit_cursor_ctl(const struct editor *e, char *ctl, size_t cap)
     /* the frame stacks a rule above the window, so the cursor's screen
      * row is home_row + 1 + (its draft row - window start) */
     int wcap = edit_window_cap();
-    int lo = br > wcap - 1 ? (int)br - (wcap - 1) : 0;
-    return edit_cursor_ctl_at(e, bc, (int)br, lo, ctl, cap);
-}
-
-/* Seek the console cursor without rewriting the line: pure cursor moves
- * leave the text pixels intact, so O(line) console traffic per keypress
- * buys nothing. */
-static void edit_cursor_pos(struct editor *e)
-{
+    int lo = br > (size_t)(wcap - 1) ? (int)br - (wcap - 1) : 0;
     char ctl[48];
-    int cn = edit_cursor_ctl(e, ctl, sizeof ctl);
+    int cn = edit_cursor_ctl_at(e, bc, (int)br, lo, ctl, sizeof ctl);
     out_frame_write(ctl, (size_t)cn);
 }
 
@@ -9180,6 +9130,15 @@ static char *api_error_message(const char *body)
  * the same sentence repeated) into a single assistant message. The default
  * keeps ~3x headroom over writing a 40KB file, whose content also counts as
  * output. */
+/* Decimal digits at *pp, advancing past them (an empty run parses to 0). */
+static int64_t str_to_i64(const char **pp)
+{
+    int64_t v = 0;
+    while (**pp >= '0' && **pp <= '9')
+        v = v * 10 + *(*pp)++ - '0';
+    return v;
+}
+
 static int64_t max_output_tokens(void)
 {
     static int64_t cached;
@@ -9189,9 +9148,7 @@ static int64_t max_output_tokens(void)
         cached = 32768;
         const char *e = env_get("KK_MAX_OUTPUT_TOKENS");
         if (e) {
-            int64_t v = 0;
-            while (*e >= '0' && *e <= '9')
-                v = v * 10 + (*e++ - '0');
+            int64_t v = str_to_i64(&e);
             if (v >= 1)
                 cached = v;
         }
@@ -9269,7 +9226,6 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
     memset(&cr, 0, sizeof cr);
     cr.st = st;
     cr.hooks = *hooks;
-    sse_parser_init(&cr.sse);
     arena_init(&cr.arena, 64 * 1024);
 
     /* join base_url + endpoint, tolerating a trailing slash */
@@ -9341,9 +9297,7 @@ static int64_t compact_window_tokens(void)
         g_window_tokens = 262144;
         const char *e = env_get("KK_CONTEXT_WINDOW");
         if (e) {
-            int64_t v = 0;
-            while (*e >= '0' && *e <= '9')
-                v = v * 10 + (*e++ - '0');
+            int64_t v = str_to_i64(&e);
             if (v >= 1)
                 g_window_tokens = v;
         }
@@ -9371,9 +9325,7 @@ static int64_t parse_context_limit(const char *err)
     for (const char *p = err; *p; p++) {
         if (*p < '0' || *p > '9')
             continue;
-        int64_t v = 0;
-        while (*p >= '0' && *p <= '9')
-            v = v * 10 + (*p++ - '0');
+        int64_t v = str_to_i64(&p);
         p--;
         if (v >= 1024 && v < compact_window_tokens() && (!best || v < best))
             best = v;
@@ -9576,8 +9528,8 @@ static void turn_feed_queue(struct conversation *cv, struct session_log *slog)
     for (char *s = take; *s;) {
         char *nl = strchr(s, '\n');
         size_t n = nl ? (size_t)(nl - s) : strlen(s);
-        char *line = xstrndup(s, n);
-        user_line_show(line);
+        char *line = xstrndup(s, n); /* conv_add takes ownership of a copy */
+        user_line_show(line, n);
         struct message *um = conv_add(cv, "user", line);
         attach_user_images(um, line);
         session_log_message(slog, um);
@@ -9634,7 +9586,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         InterlockedExchange(&g_cancel, 0);
         InterlockedExchange(&g_painted, 0);
         g_stream_bytes = 0;
-        gen_progress_reset();
+        g_gen_tool[0] = '\0';
+        g_gen_len = g_gen_lines = 0;
         g_tick_label[0] = '\0'; /* a cancelled round may have left progress */
         /* race safety: input that landed as the last round ended (too
          * late to interrupt) joins this request without interrupting */
@@ -9788,7 +9741,11 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         for (size_t i = 0; i < st.n_calls; i++) {
             m->calls[i].id = xstr_or(st.calls[i].id, "");
             m->calls[i].name = xstr_or(st.calls[i].name, "unknown");
-            m->calls[i].args = xstr_or(st.calls[i].args.p, "{}");
+            /* take the streamed args buffer whole instead of copying what
+             * can be a 100KB write payload just to free the original */
+            m->calls[i].args = st.calls[i].args.p
+                                   ? buf_detach(&st.calls[i].args)
+                                   : xstrdup("{}");
         }
         session_log_message(slog, m);
         /* The records live in their own block, m does not: every tool
