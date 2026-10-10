@@ -292,6 +292,29 @@ static char *mem_find(const char *h, size_t n, const char *nd, size_t m)
     return NULL;
 }
 
+/* Last byte equal to c inside h[0..n), or NULL. */
+static const char *mem_rfind(const char *h, size_t n, char c)
+{
+    while (n--)
+        if (h[n] == c)
+            return h + n;
+    return NULL;
+}
+
+/* Non-overlapping occurrences of nd (m bytes) in h[0..n). */
+static size_t mem_count(const char *h, size_t n, const char *nd, size_t m)
+{
+    size_t c = 0, at = 0;
+    while (at <= n) {
+        const char *hit = mem_find(h + at, n - at, nd, m);
+        if (!hit)
+            break;
+        c++;
+        at = (size_t)(hit - h) + m;
+    }
+    return c;
+}
+
 /* --- dyn arrays ------------------------------------------------------- */
 
 #define DA(T)      \
@@ -1714,15 +1737,23 @@ static DWORD WINAPI spinner_thread(LPVOID arg)
     }
 }
 
-/* Wide-string helpers for Win32 boundary calls. */
+/* Wide-string helpers for Win32 boundary calls. The length form is the
+ * primitive: passing the byte count saves a hidden strlen over a payload
+ * that can be megabytes. */
+static wchar_t *w_from_utf8_n(const char *s, size_t n)
+{
+    int c = MultiByteToWideChar(CP_UTF8, 0, s, (int)n, NULL, 0);
+    if (c <= 0)
+        return NULL;
+    wchar_t *w = xmalloc((size_t)(c + 1) * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, s, (int)n, w, c);
+    w[c] = L'\0';
+    return w;
+}
+
 static wchar_t *w_from_utf8(const char *s)
 {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
-    if (n <= 0)
-        return NULL;
-    wchar_t *w = xmalloc((size_t)n * sizeof(wchar_t));
-    MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
-    return w;
+    return w_from_utf8_n(s, strlen(s));
 }
 
 static char *utf8_from_w(const wchar_t *w)
@@ -4346,9 +4377,45 @@ static const struct tool_spec *tool_lookup(const char *name)
 
 /* --- args helpers ------------------------------------------------------- */
 
-static char *args_str(const struct jnode *args, const char *key)
+/* Tool arguments are slices of the parsed JSON, not per-arg heap strings.
+ * A value with no escape is the source slice itself; an escaped one decodes
+ * onto the tail of the shared buffer, whose capacity is fixed up front so
+ * appending can never move it and earlier slices stay valid. */
+struct args {
+    const struct jnode *j;
+    struct buf b;
+};
+
+static void args_init(struct args *a, const struct jnode *j)
 {
-    return jstr_dupz(jobj_get(args, key));
+    a->j = j;
+    a->b = (struct buf)BUF_INIT;
+    size_t need = 16;
+    if (j) {
+        for (struct jnode *pair = j->head; pair; pair = pair->next)
+            if (pair->val && pair->val->tag == J_STR)
+                need += pair->val->raw.n + 1;
+    }
+    buf_reserve(&a->b, need);
+}
+
+static struct str args_get(struct args *a, const char *key)
+{
+    struct jnode *v = jobj_get(a->j, key);
+    if (!v || v->tag != J_STR)
+        return (struct str){ NULL, 0 };
+    if (!memchr(v->raw.p, '\\', v->raw.n))
+        return v->raw;
+    size_t at = a->b.len;
+    jdecode_str(v->raw, &a->b);
+    return (struct str){ a->b.p + at, a->b.len - at };
+}
+
+/* True when the key is present as a string (an empty value counts). */
+static int args_has(const struct jnode *j, const char *key)
+{
+    struct jnode *v = jobj_get(j, key);
+    return v && v->tag == J_STR;
 }
 
 static int64_t args_int(const struct jnode *args, const char *key,
@@ -4367,7 +4434,7 @@ static char *args_summary(const struct jnode *args, const char *tool)
     if (!ts)
         return xstrdup("");
     if (strcmp(tool, "read") == 0) {
-        char *path = args_str(args, "path");
+        char *path = jstr_dupz(jobj_get(args, "path"));
         if (path && *path) {
             int64_t offset = args_int(args, "offset", 1);
             int64_t limit = args_int(args, "limit", 0);
@@ -4380,10 +4447,10 @@ static char *args_summary(const struct jnode *args, const char *tool)
         }
         free(path);
     }
-    char *s = args_str(args, ts->summary_key);
+    char *s = jstr_dupz(jobj_get(args, ts->summary_key));
     if (!s || !*s) {
         free(s);
-        s = args_str(args, "glob"); /* find's glob mode has no query */
+        s = jstr_dupz(jobj_get(args, "glob")); /* find's glob mode has no query */
         if (!s || !*s) {
             free(s);
             if (strcmp(tool, "find") == 0)
@@ -4412,15 +4479,15 @@ static char *args_summary(const struct jnode *args, const char *tool)
 
 /* --- file helpers ------------------------------------------------------- */
 
-static wchar_t *path_to_w(const char *path)
+/* The one place a path is NUL-terminated: Win32 wants a wide string, and
+ * the slash normalization runs on that buffer, so no UTF-8 copy exists
+ * just to rewrite separators. */
+static wchar_t *path_to_w(struct str path)
 {
-    /* normalize forward slashes for Win32 */
-    char *norm = xstrdup(path);
-    for (char *c = norm; *c; c++)
-        if (*c == '/')
-            *c = '\\';
-    wchar_t *w = w_from_utf8(norm);
-    free(norm);
+    wchar_t *w = w_from_utf8_n(path.p, path.n);
+    for (wchar_t *c = w; c && *c; c++)
+        if (*c == L'/')
+            *c = L'\\';
     return w;
 }
 
@@ -4430,7 +4497,7 @@ static wchar_t *path_to_w(const char *path)
 /* cap exists to keep tool reads from malloc-ing monsters; session
  * replay needs the higher bound — a long-lived session that crosses
  * 4MB must still be continuable */
-static char *file_read_all_up_to(const char *path, size_t *out_len,
+static char *file_read_all_up_to(struct str path, size_t *out_len,
                                  long long cap)
 {
     wchar_t *w = path_to_w(path);
@@ -4454,7 +4521,7 @@ static char *file_read_all_up_to(const char *path, size_t *out_len,
     return data;
 }
 
-static char *file_read_all(const char *path, size_t *out_len)
+static char *file_read_all(struct str path, size_t *out_len)
 {
     return file_read_all_up_to(path, out_len, FILE_READ_CAP);
 }
@@ -4462,7 +4529,7 @@ static char *file_read_all(const char *path, size_t *out_len)
 /* The first cap bytes whatever the file size — file_read_all_up_to refuses
  * anything larger instead of truncating, and a SKILL.md body runs to 17KB
  * while only its frontmatter is of interest. */
-static char *file_read_head(const char *path, size_t cap, size_t *out_len)
+static char *file_read_head(struct str path, size_t cap, size_t *out_len)
 {
     wchar_t *w = path_to_w(path);
     HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -4479,17 +4546,16 @@ static char *file_read_head(const char *path, size_t cap, size_t *out_len)
     return data;
 }
 
-static int file_write_all(const char *path, const char *data, size_t n)
+static int file_write_all(struct str path, const char *data, size_t n)
 {
     /* create parent directories, one level per separator */
-    const char *slash = strrchr(path, '/');
-    const char *back = strrchr(path, '\\');
+    const char *slash = mem_rfind(path.p, path.n, '/');
+    const char *back = mem_rfind(path.p, path.n, '\\');
     if (back > slash)
         slash = back;
-    if (slash && slash != path) {
-        char *dir = xstrndup(path, (size_t)(slash - path));
+    if (slash && slash != path.p) {
+        struct str dir = { path.p, (size_t)(slash - path.p) };
         wchar_t *wdir = path_to_w(dir); /* also normalizes '/' */
-        free(dir);
         for (wchar_t *c = wdir + 1; *c; c++) {
             if (*c == L'\\' || *c == L'/') {
                 wchar_t save = *c;
@@ -4539,7 +4605,7 @@ static int file_write_all(const char *path, const char *data, size_t n)
 
 /* Probe whether a path is locked by another process (editors hold their
  * files open exclusively-ish; sharing violations surface here). */
-static int file_locked(const char *path)
+static int file_locked(struct str path)
 {
     wchar_t *w = path_to_w(path);
     HANDLE f = CreateFileW(w, GENERIC_READ, 0, NULL, OPEN_EXISTING,
@@ -4557,97 +4623,77 @@ static int file_locked(const char *path)
  * tool call. Without it those tools return an error and the agent falls
  * back to bash pipelines. fff.h provides the struct layouts; the functions
  * resolve through LoadLibrary (no import library ships with the DLL). */
-static HMODULE fff_mod;
 static void *fff_inst;
 static int fff_tried, fff_ok;
 static SRWLOCK fff_lock = SRWLOCK_INIT;
 
-typedef struct FffResult *(*fff_api_create)(struct FffCreateOptions);
-typedef struct FffResult *(*fff_api_search)(void *, const char *,
-                                            const char *, uint32_t, uint32_t,
-                                            uint32_t, int32_t, uint32_t);
-typedef struct FffResult *(*fff_api_grep)(void *, const char *, uint8_t,
-                                          uint64_t, uint32_t, bool, uint32_t,
-                                          uint32_t, uint64_t, uint32_t,
-                                          uint32_t, bool);
-typedef struct FffResult *(*fff_api_glob)(void *, const char *, const char *,
-                                          uint32_t, uint32_t, uint32_t);
-typedef struct FffResult *(*fff_api_multi_grep)(void *, const char *,
-                                                const char *, uint64_t,
-                                                uint32_t, bool, uint32_t,
-                                                uint32_t, uint64_t, uint32_t,
-                                                uint32_t, bool);
-typedef struct FffResult *(*fff_api_grep_ex)(void *, const char *, uint8_t,
-                                             uint64_t, uint32_t, bool,
-                                             uint32_t, uint32_t, uint64_t,
-                                             bool, uint32_t, uint32_t, bool);
-typedef struct FffResult *(*fff_api_track)(void *, const char *, const char *);
-typedef bool (*fff_api_isscanning)(void *);
-typedef struct FffResult *(*fff_api_simple)(void *);
-typedef struct FffResult *(*fff_api_wait)(void *, uint64_t);
-typedef void (*fff_api_destroy)(void *);
-typedef void (*fff_api_free)(struct FffResult *);
-typedef void (*fff_api_free_search)(struct FffSearchResult *);
-typedef void (*fff_api_free_grep)(struct FffGrepResult *);
+/* The DLL's C ABI resolved onto one struct: "does this fff.dll have the
+ * newer entry point" is a NULL member test, not a file-scope global. */
+static struct {
+    struct FffResult *(*create)(struct FffCreateOptions);
+    struct FffResult *(*search)(void *, const char *, const char *, uint32_t,
+                                uint32_t, uint32_t, int32_t, uint32_t);
+    struct FffResult *(*grep)(void *, const char *, uint8_t, uint64_t,
+                              uint32_t, bool, uint32_t, uint32_t, uint64_t,
+                              uint32_t, uint32_t, bool);
+    struct FffResult *(*glob)(void *, const char *, const char *, uint32_t,
+                              uint32_t, uint32_t);
+    struct FffResult *(*multi_grep)(void *, const char *, const char *,
+                                    uint64_t, uint32_t, bool, uint32_t,
+                                    uint32_t, uint64_t, uint32_t, uint32_t,
+                                    bool);
+    struct FffResult *(*grep_ex)(void *, const char *, uint8_t, uint64_t,
+                                 uint32_t, bool, uint32_t, uint32_t, uint64_t,
+                                 bool, uint32_t, uint32_t, bool);
+    struct FffResult *(*track)(void *, const char *, const char *);
+    bool (*is_scanning)(void *);
+    struct FffResult *(*scan)(void *);
+    struct FffResult *(*refresh_git)(void *);
+    struct FffResult *(*wait)(void *, uint64_t);
+    struct FffResult *(*wait_watcher)(void *, uint64_t);
+    void (*free_result)(struct FffResult *);
+    void (*free_search)(struct FffSearchResult *);
+    void (*free_grep)(struct FffGrepResult *);
+} fff;
 
-static fff_api_create p_create;
-static fff_api_search p_search;
-static fff_api_grep p_grep;
-static fff_api_grep_ex p_grep_ex;
-static fff_api_glob p_glob;
-static fff_api_multi_grep p_multi_grep;
-static fff_api_track p_track;
-static fff_api_isscanning p_isscanning;
-static fff_api_simple p_scan;
-static fff_api_simple p_refresh_git;
-static fff_api_wait p_wait;
-static fff_api_wait p_wait_watcher;
-static fff_api_destroy p_destroy;
-static fff_api_free p_free;
-static fff_api_free_search p_free_search;
-static fff_api_free_grep p_free_grep;
+/* The first FFF_REQUIRED are mandatory; the rest only cost a newer feature
+ * when an older fff.dll ships next to kk.exe. */
+#define FFF_REQUIRED 8
+static const struct {
+    const char *name;
+    void **slot;
+} fff_exports[] = {
+    { "fff_create_instance_with_value", (void **)&fff.create },
+    { "fff_search", (void **)&fff.search },
+    { "fff_live_grep", (void **)&fff.grep },
+    { "fff_scan_files", (void **)&fff.scan },
+    { "fff_wait_for_scan", (void **)&fff.wait },
+    { "fff_free_result", (void **)&fff.free_result },
+    { "fff_free_search_result", (void **)&fff.free_search },
+    { "fff_free_grep_result", (void **)&fff.free_grep },
+    { "fff_glob", (void **)&fff.glob },
+    { "fff_multi_grep", (void **)&fff.multi_grep },
+    { "fff_track_query", (void **)&fff.track },
+    { "fff_wait_for_watcher", (void **)&fff.wait_watcher },
+    { "fff_live_grep_ex", (void **)&fff.grep_ex },
+    { "fff_refresh_git_status", (void **)&fff.refresh_git },
+    { "fff_is_scanning", (void **)&fff.is_scanning },
+};
 
-/* LoadLibrary + resolve every symbol the tools need. */
+/* LoadLibrary + resolve every export the tools use. */
 static void fff_load(void)
 {
     if (fff_tried)
         return;
     fff_tried = 1;
-    fff_mod = LoadLibraryW(L"fff.dll");
-    if (!fff_mod)
+    HMODULE mod = LoadLibraryW(L"fff.dll");
+    if (!mod)
         return;
-    const struct {
-        const char *name;
-        void **slot;
-    } need[] = {
-        { "fff_create_instance_with_value", (void **)&p_create },
-        { "fff_search", (void **)&p_search },
-        { "fff_live_grep", (void **)&p_grep },
-        { "fff_scan_files", (void **)&p_scan },
-        { "fff_wait_for_scan", (void **)&p_wait },
-        { "fff_destroy", (void **)&p_destroy },
-        { "fff_free_result", (void **)&p_free },
-        { "fff_free_search_result", (void **)&p_free_search },
-        { "fff_free_grep_result", (void **)&p_free_grep },
-    };
-    for (size_t i = 0; i < sizeof need / sizeof need[0]; i++)
-        if (!(*need[i].slot = (void *)GetProcAddress(fff_mod, need[i].name)))
-            return; /* a missing export marks the DLL unusable */
-    /* optional exports: an older DLL only loses the newer features */
-    const struct {
-        const char *name;
-        void **slot;
-    } opt[] = {
-        { "fff_glob", (void **)&p_glob },
-        { "fff_multi_grep", (void **)&p_multi_grep },
-        { "fff_track_query", (void **)&p_track },
-        { "fff_wait_for_watcher", (void **)&p_wait_watcher },
-        { "fff_live_grep_ex", (void **)&p_grep_ex },
-        { "fff_refresh_git_status", (void **)&p_refresh_git },
-        { "fff_is_scanning", (void **)&p_isscanning },
-    };
-    for (size_t i = 0; i < sizeof opt / sizeof opt[0]; i++)
-        *opt[i].slot = (void *)GetProcAddress(fff_mod, opt[i].name);
+    for (size_t i = 0; i < sizeof fff_exports / sizeof fff_exports[0]; i++) {
+        *fff_exports[i].slot = (void *)GetProcAddress(mod, fff_exports[i].name);
+        if (!*fff_exports[i].slot && i < FFF_REQUIRED)
+            return; /* a missing required export marks the DLL unusable */
+    }
     fff_ok = 1;
 }
 
@@ -4695,19 +4741,19 @@ static int fff_ensure(void)
         o.enable_content_indexing = 1;
         o.watch = 1;
         o.ai_mode = 1;
-        struct FffResult *r = p_create(o);
+        struct FffResult *r = fff.create(o);
         if (!r || !r->success || !r->handle) {
             if (r)
-                p_free(r);
+                fff.free_result(r);
             ReleaseSRWLockExclusive(&fff_lock);
             return 0;
         }
         fff_inst = r->handle;
-        p_free(r);
-        p_scan(fff_inst);
-        p_wait(fff_inst, 10000); /* bound the wait; late files join the index */
-        if (p_wait_watcher)
-            p_wait_watcher(fff_inst, 2000); /* live edits from here on */
+        fff.free_result(r);
+        fff.scan(fff_inst);
+        fff.wait(fff_inst, 10000); /* bound the wait; late files join the index */
+        if (fff.wait_watcher)
+            fff.wait_watcher(fff_inst, 2000); /* live edits from here on */
     }
     ReleaseSRWLockExclusive(&fff_lock);
     return 1;
@@ -4729,11 +4775,11 @@ static void fff_note_write(void)
 {
     if (!fff_ok || !fff_inst)
         return;
-    p_scan(fff_inst);
-    if (p_refresh_git) {
-        struct FffResult *g = p_refresh_git(fff_inst);
+    fff.scan(fff_inst);
+    if (fff.refresh_git) {
+        struct FffResult *g = fff.refresh_git(fff_inst);
         if (g)
-            p_free(g);
+            fff.free_result(g);
     }
 }
 
@@ -4794,7 +4840,7 @@ static void buf_append_line_capped(struct buf *out, const char *s, size_t n)
 static char *fff_query(const struct jnode *args, const char *what,
                        char **query)
 {
-    *query = args_str(args, "query");
+    *query = jstr_dupz(jobj_get(args, "query"));
     if (!*query || !**query) {
         free(*query);
         *query = NULL;
@@ -4810,8 +4856,8 @@ static char *fff_query(const struct jnode *args, const char *what,
 
 static char *tool_find(const struct jnode *args)
 {
-    char *query = args_str(args, "query");
-    char *glob = args_str(args, "glob");
+    char *query = jstr_dupz(jobj_get(args, "query"));
+    char *glob = jstr_dupz(jobj_get(args, "glob"));
     if (glob && !*glob) {
         free(query);
         free(glob);
@@ -4828,12 +4874,12 @@ static char *tool_find(const struct jnode *args)
         off = 0;
     const char *tracked = query;
     struct FffResult *r = NULL;
-    if (glob && *glob && p_glob) {
+    if (glob && *glob && fff.glob) {
         tracked = glob; /* glob mode: rank by frecency, no fuzzy needed */
-        r = p_glob(fff_inst, glob, NULL, 0, (uint32_t)off, 20);
+        r = fff.glob(fff_inst, glob, NULL, 0, (uint32_t)off, 20);
     } else {
         /* an empty query is fff's "whole index, ranked by frecency" */
-        r = p_search(fff_inst, query ? query : "", NULL, 0, (uint32_t)off,
+        r = fff.search(fff_inst, query ? query : "", NULL, 0, (uint32_t)off,
                      20, 0, 0);
     }
     if (!r) {
@@ -4843,16 +4889,16 @@ static char *tool_find(const struct jnode *args)
     }
     if (!r->success) {
         char *msg = xasprintf("error: %s", r->error ? r->error : "find failed");
-        p_free(r);
+        fff.free_result(r);
         free(query);
         free(glob);
         return msg;
     }
     struct FffSearchResult *sr = r->handle;
-    if (p_track && sr->count > 0 && tracked && *tracked)
-        p_track(fff_inst, tracked, sr->items[0].relative_path);
+    if (fff.track && sr->count > 0 && tracked && *tracked)
+        fff.track(fff_inst, tracked, sr->items[0].relative_path);
     /* tracked points into query/glob: the frees must wait until after
-     * p_track (ASan caught this exact use-after-free) */
+     * fff.track (ASan caught this exact use-after-free) */
     free(query);
     free(glob);
     struct buf out = BUF_INIT;
@@ -4866,7 +4912,7 @@ static char *tool_find(const struct jnode *args)
     }
     buf_appendf(&out, "%u of %u indexed files matched\n", sr->total_matched,
                 sr->total_files);
-    if (p_isscanning && p_isscanning(fff_inst))
+    if (fff.is_scanning && fff.is_scanning(fff_inst))
         buf_appends(&out, "[workspace index still scanning: results may "
                           "be incomplete; re-run shortly]\n");
     /* offset is a fff page index, so the entry numbers have to be scaled
@@ -4878,8 +4924,8 @@ static char *tool_find(const struct jnode *args)
                           "%u for the next page]\n",
                     first + 1, first + sr->count, sr->total_matched,
                     (uint32_t)off + 1);
-    p_free_search(sr);
-    p_free(r);
+    fff.free_search(sr);
+    fff.free_result(r);
     return buf_detach(&out);
 }
 
@@ -4908,21 +4954,21 @@ static char *tool_grep(const struct jnode *args)
      * The time budget also bounds zero-match walks, and next_file_offset
      * reports what the budget could not cover. */
     struct FffResult *r;
-    if (p_multi_grep && strchr(query, '\n'))
-        r = p_multi_grep(fff_inst, query, NULL, 0, 5, 1, (uint32_t)off, 30,
+    if (fff.multi_grep && strchr(query, '\n'))
+        r = fff.multi_grep(fff_inst, query, NULL, 0, 5, 1, (uint32_t)off, 30,
                          2000, 1, 1, 1);
-    else if (p_grep_ex)
-        r = p_grep_ex(fff_inst, query, (uint8_t)mode, 0, 5, 1, (uint32_t)off,
+    else if (fff.grep_ex)
+        r = fff.grep_ex(fff_inst, query, (uint8_t)mode, 0, 5, 1, (uint32_t)off,
                       30, 2000, 1, 1, 1, 1);
     else
-        r = p_grep(fff_inst, query, (uint8_t)mode, 0, 5, 1, (uint32_t)off, 30,
+        r = fff.grep(fff_inst, query, (uint8_t)mode, 0, 5, 1, (uint32_t)off, 30,
                    2000, 1, 1, 1);
     free(query);
     if (!r)
         return xstrdup("error: grep failed");
     if (!r->success) {
         char *msg = xasprintf("error: %s", r->error ? r->error : "grep failed");
-        p_free(r);
+        fff.free_result(r);
         return msg;
     }
     struct FffGrepResult *gr = r->handle;
@@ -4947,15 +4993,15 @@ static char *tool_grep(const struct jnode *args)
         shown++;
     }
     buf_appendf(&out, "%u matches\n", shown); /* binary hits are not shown */
-    if (p_isscanning && p_isscanning(fff_inst))
+    if (fff.is_scanning && fff.is_scanning(fff_inst))
         buf_appends(&out, "[workspace index still scanning: results may "
                           "be incomplete; re-run shortly]\n");
     if (gr->next_file_offset)
         buf_appendf(&out, "[time budget hit: files from offset %u are "
                           "unsearched; re-run with offset %u to continue]\n",
                     gr->next_file_offset, gr->next_file_offset);
-    p_free_grep(gr);
-    p_free(r);
+    fff.free_grep(gr);
+    fff.free_result(r);
     return buf_detach(&out);
 }
 
@@ -4968,7 +5014,7 @@ static char *b64_encode(const char *data, size_t n);
 static char *g_tool_image_b64;
 static char *g_tool_image_mime;
 
-static const char *image_mime_of(const char *path, const char *data,
+static const char *image_mime_of(struct str path, const char *data,
                                  size_t len);
 
 /* Image formats vision models commonly accept, keyed by extension with
@@ -5274,13 +5320,13 @@ static int attach_user_images(struct message *m, const char *text)
         }
         if (!mime || !keep)
             continue;
-        path[keep] = '\0';
+        struct str ps = { path, keep };
         size_t len = 0;
-        char *data = file_read_all(path, &len);
+        char *data = file_read_all(ps, &len);
         if (!data)
             continue;
         /* magic bytes confirm what the extension claimed */
-        if (image_mime_of(path, data, len)) {
+        if (image_mime_of(ps, data, len)) {
             struct image_part part = { xstrdup(mime), b64_encode(data, len) };
             if (part.mime && part.b64) {
                 DA_PUSH(m->images, part);
@@ -5297,15 +5343,21 @@ static int attach_user_images(struct message *m, const char *text)
 
 /* Detect an image by extension AND magic bytes; NULL when not one of
  * the four formats vision models commonly accept. */
-static const char *image_mime_of(const char *path, const char *data,
+static const char *image_mime_of(struct str path, const char *data,
                                  size_t len)
 {
-    const char *dot = strrchr(path, '.');
+    const char *dot = mem_rfind(path.p, path.n, '.');
     if (!dot)
         return NULL;
+    size_t elen = (size_t)(path.p + path.n - dot);
+    char ext[8]; /* extensions are 3-5 bytes; a longer tail is not one */
+    if (elen >= sizeof ext)
+        return NULL;
+    memcpy(ext, dot, elen);
+    ext[elen] = '\0';
     for (size_t i = 0; i < sizeof known_image_exts / sizeof known_image_exts[0];
          i++) {
-        if (_stricmp(dot, known_image_exts[i].ext) != 0)
+        if (_stricmp(ext, known_image_exts[i].ext) != 0)
             continue;
         if (len < 12
             || memcmp(data, known_image_exts[i].magic,
@@ -5340,11 +5392,13 @@ static size_t read_line_prefix(char *dst, size_t line_no)
 
 static char *tool_read(const struct jnode *args)
 {
+    struct args a;
+    args_init(&a, args);
     char *result = NULL;
-    char *path = args_str(args, "path");
+    struct str path = args_get(&a, "path");
     char *data = NULL;
     struct buf out = BUF_INIT;
-    if (!path || !*path) {
+    if (!path.n) {
         result = xstrdup("error: read requires a path");
         goto cleanup;
     }
@@ -5365,11 +5419,11 @@ static char *tool_read(const struct jnode *args)
             unsigned long long sz =
                 ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
             if (sz > FILE_READ_CAP) {
-                result = xasprintf("error: '%s' is %llu MB — too large to "
+                result = xasprintf("error: '%.*s' is %llu MB — too large to "
                                    "read whole; slice it with bash "
                                    "(Get-Content -TotalCount / "
                                    "Select-Object -Skip)",
-                                   path, sz / (1024 * 1024));
+                                   (int)path.n, path.p, sz / (1024 * 1024));
                 free(w);
                 goto cleanup;
             }
@@ -5380,7 +5434,7 @@ static char *tool_read(const struct jnode *args)
     size_t len = 0;
     data = file_read_all(path, &len);
     if (!data) {
-        result = xasprintf("error: cannot read '%s'", path);
+        result = xasprintf("error: cannot read '%.*s'", (int)path.n, path.p);
         goto cleanup;
     }
     if (file_locked(path)) {
@@ -5396,8 +5450,8 @@ static char *tool_read(const struct jnode *args)
         free(g_tool_image_mime);
         g_tool_image_b64 = b64;
         g_tool_image_mime = xstrdup(mime);
-        buf_appendf(&out, "[image] %s (%s, %zu bytes) attached\r\n", path,
-                    mime, len);
+        buf_appendf(&out, "[image] %.*s (%s, %zu bytes) attached\r\n",
+                    (int)path.n, path.p, mime, len);
         result = buf_detach(&out);
         goto cleanup;
     }
@@ -5409,8 +5463,8 @@ static char *tool_read(const struct jnode *args)
             && data[k] != '\r')
             binary = 1;
     if (binary) {
-        result = xasprintf("error: '%s' is a binary file (%zu bytes); "
-                           "use bash to inspect it", path, len);
+        result = xasprintf("error: '%.*s' is a binary file (%zu bytes); "
+                           "use bash to inspect it", (int)path.n, path.p, len);
         goto cleanup;
     }
     /* invalid UTF-8: assume the console codepage (GBK on zh-CN) and
@@ -5419,11 +5473,11 @@ static char *tool_read(const struct jnode *args)
     /* walk to EOF even after the limit: the model is told the file's
      * full line count instead of being left to guess */
     size_t line_no = 0, emitted = 0, last = 0;
-    char *p = data;
-    while (*p) {
+    const char *p = data, *end = data + len;
+    while (p < end) {
         line_no++;
-        char *nl = strchr(p, '\n');
-        size_t llen = nl ? (size_t)(nl - p) : strlen(p);
+        const char *nl = mem_find(p, (size_t)(end - p), "\n", 1);
+        size_t llen = nl ? (size_t)(nl - p) : (size_t)(end - p);
         if (line_no >= (size_t)offset && emitted < (size_t)limit) {
             char pre[28];
             buf_append_n(&out, pre, read_line_prefix(pre, line_no));
@@ -5431,7 +5485,7 @@ static char *tool_read(const struct jnode *args)
             emitted++;
             last = line_no;
         }
-        p = nl ? nl + 1 : p + llen;
+        p = nl ? nl + 1 : end;
     }
     if (line_no == 0)
         buf_appends(&out, "(empty file)\n");
@@ -5447,70 +5501,68 @@ static char *tool_read(const struct jnode *args)
 cleanup:
     buf_free(&out);
     free(data);
-    free(path);
+    buf_free(&a.b);
     return result;
 }
 
 /* --- write --------------------------------------------------------------- */
 
-/* Insert \r before every bare \n (heap string): shapes old_string and the
- * replacement to a CRLF file when a bare-\n form failed to match. */
-static char *crlf_fix(const char *s)
+/* Append s to out with \r inserted before every bare \n: shapes old_string
+ * and the replacement to a CRLF file when a bare-\n form failed to match. */
+static void crlf_fix(struct str s, struct buf *out)
 {
-    size_t extra = 0;
-    for (size_t k = 0; s[k]; k++)
-        if (s[k] == '\n' && (k == 0 || s[k - 1] != '\r'))
-            extra++;
-    char *o = xmalloc(strlen(s) + extra + 1);
-    size_t w = 0;
-    for (size_t k = 0; s[k]; k++) {
-        if (s[k] == '\n' && (k == 0 || s[k - 1] != '\r'))
-            o[w++] = '\r';
-        o[w++] = s[k];
+    for (size_t k = 0; k < s.n; k++) {
+        if (s.p[k] == '\n' && (k == 0 || s.p[k - 1] != '\r'))
+            buf_appendc(out, '\r');
+        buf_appendc(out, s.p[k]);
     }
-    o[w] = '\0';
-    return o;
 }
 
 static char *tool_write(const struct jnode *args)
 {
-    char *path = args_str(args, "path");
-    char *content = args_str(args, "content");
-    char *old_s = args_str(args, "old_string");
+    struct args a;
+    args_init(&a, args);
+    struct str path = args_get(&a, "path");
+    struct str content = args_get(&a, "content");
+    struct str old_s = args_get(&a, "old_string");
     struct jnode *ra = jobj_get(args, "replace_all");
     int replace_all = ra && ra->tag == J_TRUE;
     char *result = NULL;
     char *data = NULL;
     struct buf out = BUF_INIT;
+    struct buf crlf_old = BUF_INIT, crlf_new = BUF_INIT;
 
-    if (!path || !*path || !content) {
+    if (!path.n || !args_has(args, "content")) {
         result = xstrdup("error: write requires path and content");
         goto cleanup;
     }
-    if (!old_s) {
+    if (!args_has(args, "old_string")) {
         /* create or overwrite the whole file */
         if (file_locked(path)) {
             result = xstrdup("error: file is locked by another process");
             goto cleanup;
         }
-        if (file_write_all(path, content, strlen(content)) != 0) {
-            result = xasprintf("error: cannot write '%s'", path);
+        if (file_write_all(path, content.p, content.n) != 0) {
+            result = xasprintf("error: cannot write '%.*s'", (int)path.n,
+                               path.p);
             goto cleanup;
         }
         fff_note_write();
-        result = xasprintf("wrote %zu bytes to %s", strlen(content), path);
+        result = xasprintf("wrote %zu bytes to %.*s", content.n, (int)path.n,
+                           path.p);
         goto cleanup;
     }
     /* precise replace: old_string must appear exactly once unless
      * replace_all; content becomes the replacement text. An empty
-     * old_string would make the strstr match loop step zero bytes —
+     * old_string would make the match loop step zero bytes —
      * a hang — so it is rejected outright. */
-    if (!*old_s) {
+    if (!old_s.n) {
         result = xstrdup("error: old_string must not be empty; omit it "
                          "to overwrite the whole file");
         goto cleanup;
     }
-    if (strstr(old_s, "…[line truncated]")) {
+    static const char cut_marker[] = "…[line truncated]";
+    if (mem_find(old_s.p, old_s.n, cut_marker, sizeof cut_marker - 1)) {
         /* the model copied a read line that was cut at KK_LINE_COLS: it
          * can never match the file, so say so instead of failing with a
          * bare not-found */
@@ -5527,60 +5579,54 @@ static char *tool_write(const struct jnode *args)
     size_t len = 0;
     data = file_read_all(path, &len);
     if (!data) {
-        result = xasprintf("error: cannot read '%s'", path);
+        result = xasprintf("error: cannot read '%.*s'", (int)path.n, path.p);
         goto cleanup;
     }
     /* invalid UTF-8 on disk (GBK etc.): transcode in memory so old_string
      * matching works; the file is written back as UTF-8 */
     transcode_to_utf8(&data, &len);
 
-    size_t count = 0;
-    size_t old_len = strlen(old_s);
-    for (char *p = data; (p = strstr(p, old_s)) != NULL; p += old_len)
-        count++;
+    struct str oldv = old_s, newv = content;
+    size_t count = mem_count(data, len, oldv.p, oldv.n);
     /* CRLF tolerance: the read output shows lines without their \r, so a
      * multi-line old_string arrives with bare \n — retry against the file's
      * CRLF before giving up; the replacement text gets the same endings */
-    if (count == 0 && strstr(data, "\r\n") && strchr(old_s, '\n')) {
-        char *old2 = crlf_fix(old_s);
-        char *new2 = crlf_fix(content);
-        for (char *p = data; (p = strstr(p, old2)) != NULL; p += strlen(old2))
-            count++;
+    if (count == 0 && mem_find(data, len, "\r\n", 2)
+        && memchr(old_s.p, '\n', old_s.n)) {
+        crlf_fix(old_s, &crlf_old);
+        crlf_fix(content, &crlf_new);
+        count = mem_count(data, len, crlf_old.p, crlf_old.len);
         if (count) {
-            free(old_s);
-            old_s = old2;
-            free(content);
-            content = new2;
-            old_len = strlen(old_s);
-        } else {
-            free(old2);
-            free(new2);
+            oldv = (struct str){ crlf_old.p, crlf_old.len };
+            newv = (struct str){ crlf_new.p, crlf_new.len };
         }
     }
     if (count == 0) {
-        result = xasprintf("error: old_string not found in %s", path);
+        result = xasprintf("error: old_string not found in %.*s", (int)path.n,
+                           path.p);
         goto cleanup;
     }
     if (count > 1 && !replace_all) {
-        result = xasprintf("error: old_string appears %zu times in %s; "
+        result = xasprintf("error: old_string appears %zu times in %.*s; "
                            "add surrounding context to make it unique, "
-                           "or set replace_all", count, path);
+                           "or set replace_all", count, (int)path.n, path.p);
         goto cleanup;
     }
-    char *p = data;
+    size_t at = 0;
     for (;;) {
-        char *hit = strstr(p, old_s);
+        char *hit = mem_find(data + at, len - at, oldv.p, oldv.n);
         if (!hit) {
-            buf_appends(&out, p); /* trailing remainder */
+            buf_append_n(&out, data + at, len - at); /* trailing remainder */
             break;
         }
-        buf_append_n(&out, p, (size_t)(hit - p));
-        buf_appends(&out, content);
-        p = hit + old_len;
-        if (!*p)
+        size_t off = (size_t)(hit - data);
+        buf_append_n(&out, data + at, off - at);
+        buf_append_n(&out, newv.p, newv.n);
+        at = off + oldv.n;
+        if (at >= len)
             break; /* replaced up to the end */
         if (!replace_all) {
-            buf_appends(&out, p); /* keep the un-replaced tail */
+            buf_append_n(&out, data + at, len - at); /* keep the tail */
             break;
         }
     }
@@ -5590,20 +5636,21 @@ static char *tool_write(const struct jnode *args)
     /* compact diff: show what changed for the user and the model */
     if (rc == 0) {
         struct buf msg = BUF_INIT;
-        buf_appendf(&msg, "edited %s (%zu replacement%s)\n", path, count,
-                    count == 1 ? "" : "s");
-        buf_appendf(&msg, "  - %s\n  + %s\n", old_s, content);
+        buf_appendf(&msg, "edited %.*s (%zu replacement%s)\n", (int)path.n,
+                    path.p, count, count == 1 ? "" : "s");
+        buf_appendf(&msg, "  - %.*s\n  + %.*s\n", (int)oldv.n, oldv.p,
+                    (int)newv.n, newv.p);
         result = buf_detach(&msg);
     } else {
-        result = xasprintf("error: cannot write '%s'", path);
+        result = xasprintf("error: cannot write '%.*s'", (int)path.n, path.p);
     }
 
 cleanup:
     buf_free(&out);
     free(data);
-    free(path);
-    free(content);
-    free(old_s);
+    buf_free(&crlf_old);
+    buf_free(&crlf_new);
+    buf_free(&a.b);
     return result;
 }
 
@@ -5990,7 +6037,7 @@ static void clixml_decode(struct buf *b)
 
 /* Run a command through the persistent PowerShell session. Returns 0
  * and fills output/exit_code; nonzero when the session cannot spawn. */
-static int shell_run(const char *command,
+static int shell_run(struct str command,
                      long timeout_ms, struct buf *output, int *exit_code)
 {
     if (timeout_ms <= 0)
@@ -6005,7 +6052,7 @@ static int shell_run(const char *command,
         struct buf line = BUF_INIT;
         buf_appends(&line, g_ps_guid);
         buf_appendc(&line, '\n');
-        buf_appends(&line, command);
+        buf_append_n(&line, command.p, command.n);
         char *b64 = b64_encode(line.p, line.len);
         buf_free(&line);
         char *wire = xasprintf("%s\r\n", b64);
@@ -6153,9 +6200,11 @@ static int shell_run(const char *command,
 
 static char *tool_bash(const struct jnode *args)
 {
-    char *command = args_str(args, "command");
-    if (!command || !*command) {
-        free(command);
+    struct args a;
+    args_init(&a, args);
+    struct str command = args_get(&a, "command");
+    if (!command.n) {
+        buf_free(&a.b);
         return xstrdup("error: bash requires a command");
     }
     long timeout = (long)args_int(args, "timeout_ms", 120000);
@@ -6210,7 +6259,7 @@ static char *tool_bash(const struct jnode *args)
             result = xasprintf("exit %d\n%.*s", exit_code, (int)(e - s), s);
     }
     buf_free(&out);
-    free(command);
+    buf_free(&a.b);
     return result;
 }
 
@@ -6526,7 +6575,7 @@ static void session_log_compact(struct session_log *sl, size_t keep,
 static int session_load(const char *path, struct conversation *cv)
 {
     size_t len = 0;
-    char *data = file_read_all_up_to(path, &len, SESSION_READ_CAP);
+    char *data = file_read_all_up_to(str_from_c(path), &len, SESSION_READ_CAP);
     if (!data)
         return -1;
     struct arena a;
@@ -6639,7 +6688,7 @@ static void session_open(struct session_log *sl, int cont,
 
     if (cont) {
         size_t plen = 0;
-        char *prev = file_read_all(cur, &plen);
+        char *prev = file_read_all(str_from_c(cur), &plen);
         if (prev) {
             while (plen > 0 && (prev[plen - 1] == '\n' || prev[plen - 1] == '\r'))
                 prev[--plen] = '\0';
@@ -6818,7 +6867,7 @@ static void sess_scan_file(struct sess_row *row)
     row->preview[0] = '\0';
     row->turns = 0;
     size_t len = 0;
-    char *data = file_read_all_up_to(row->path, &len, 2 * 1024 * 1024);
+    char *data = file_read_all_up_to(str_from_c(row->path), &len, 2 * 1024 * 1024);
     if (!data)
         return;
     struct arena a;
@@ -7008,7 +7057,7 @@ static char *load_agents_md(void)
     int any = 0;
     for (int i = n - 1; i >= 0; i--) {
         size_t len = 0;
-        char *data = file_read_all(paths[i], &len);
+        char *data = file_read_all(str_from_c(paths[i]), &len);
         if (data) {
             if (any)
                 buf_appends(&out, "\n\n");
@@ -7120,7 +7169,7 @@ static void skill_describe(const char *dir, const char *dname, struct buf *out,
 {
     char *path = xasprintf("%s\\SKILL.md", dir);
     size_t len = 0;
-    char *data = file_read_head(path, SKILL_HEAD_MAX, &len);
+    char *data = file_read_head(str_from_c(path), SKILL_HEAD_MAX, &len);
     if (!data)
         goto done;
     char *fm = data;
@@ -8698,7 +8747,7 @@ static char *workspace_snapshot(void)
     struct arena a;
     arena_init(&a, 512);
     struct jnode *args = json_parse(&a, "{}", 2);
-    /* an argument-less find is the list mode; it skips p_track, so seeding
+    /* an argument-less find is the list mode; it skips fff.track, so seeding
      * the prompt never skews the ranking it reads */
     char *listing = args ? tool_find(args) : NULL;
     arena_free(&a);
@@ -9742,6 +9791,11 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             m->calls[i].args = xstr_or(st.calls[i].args.p, "{}");
         }
         session_log_message(slog, m);
+        /* The records live in their own block, m does not: every tool
+         * message appended below can realloc cv->msgs and move m, so the
+         * loop reads the calls through this snapshot. */
+        struct tool_call_rec *calls = m->calls;
+        size_t n_calls = m->n_calls;
 
         /* a tools-only response fires no text hooks, so g_busy still
          * reads 1 (waiting): the spinner must go quiet before the tool
@@ -9749,9 +9803,9 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         InterlockedExchange(&g_busy, 2);
         /* execute every call: full display, full output to the model */
         int cancelled = 0;
-        for (size_t i = 0; i < m->n_calls; i++) {
-            const char *name = m->calls[i].name;
-            const char *args_json = m->calls[i].args;
+        for (size_t i = 0; i < n_calls; i++) {
+            const char *name = calls[i].name;
+            const char *args_json = calls[i].args;
 
             struct arena ta;
             arena_init(&ta, 8 * 1024);
@@ -9794,7 +9848,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             status_repaint(); /* refresh the status row after tool output */
 
             struct message *tm = conv_add_take(cv, "tool", output);
-            tm->tool_call_id = xstrdup(m->calls[i].id);
+            tm->tool_call_id = xstrdup(calls[i].id);
             if (img_b64 && img_mime) {
                 struct image_part part = { img_mime, img_b64 };
                 DA_PUSH(tm->images, part); /* ownership moves */
@@ -9809,10 +9863,10 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                  * committed and logged: every call left unrun needs a tool
                  * message, or the next request is a 400 that --continue
                  * replays for the rest of the session */
-                for (size_t j = i + 1; j < m->n_calls; j++) {
+                for (size_t j = i + 1; j < n_calls; j++) {
                     struct message *stub = conv_add(cv, "tool",
                                     "(cancelled before this call ran)");
-                    stub->tool_call_id = xstrdup(m->calls[j].id);
+                    stub->tool_call_id = xstrdup(calls[j].id);
                     session_log_message(slog, stub);
                 }
                 break;
