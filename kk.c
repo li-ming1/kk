@@ -9240,23 +9240,55 @@ static int error_is_context_overflow(const char *err)
 /* Configured context window in tokens (KK_CONTEXT_WINDOW, default 128k).
  * The auto-compact trigger and the summarizer's input budget derive
  * from it. */
+/* Assumed context window in tokens: KK_CONTEXT_WINDOW over a 256k default.
+ * Corrected downward at runtime when an overflow rejection tells us the real
+ * limit — guessing high is only safe because that correction exists. */
+static int64_t g_window_tokens;
+
 static int64_t compact_window_tokens(void)
 {
-    static int64_t cached;
-    static int read;
-    if (!read) {
-        read = 1;
-        cached = 131072;
+    if (!g_window_tokens) {
+        g_window_tokens = 262144;
         const char *e = env_get("KK_CONTEXT_WINDOW");
         if (e) {
             int64_t v = 0;
             while (*e >= '0' && *e <= '9')
                 v = v * 10 + (*e++ - '0');
             if (v >= 1)
-                cached = v;
+                g_window_tokens = v;
         }
     }
-    return cached;
+    return g_window_tokens;
+}
+
+/* Adopt a limit learned from an error, only if it is smaller than what we
+ * assumed and not absurd. Returns 1 when the window changed. */
+static int adopt_window_tokens(int64_t v)
+{
+    if (v < 1024 || v >= compact_window_tokens())
+        return 0;
+    g_window_tokens = v;
+    return 1;
+}
+
+/* Smallest plausible token count in an overflow message. Providers word
+ * these differently and several quote the requested size before the limit,
+ * but the limit is always below what we just assumed while the requested
+ * size is above it — so the minimum wins. */
+static int64_t parse_context_limit(const char *err)
+{
+    int64_t best = 0;
+    for (const char *p = err; *p; p++) {
+        if (*p < '0' || *p > '9')
+            continue;
+        int64_t v = 0;
+        while (*p >= '0' && *p <= '9')
+            v = v * 10 + (*p++ - '0');
+        p--;
+        if (v >= 1024 && v < compact_window_tokens() && (!best || v < best))
+            best = v;
+    }
+    return best;
 }
 
 /* Overflow recovery when the whole history IS the current turn (no head
@@ -9339,7 +9371,10 @@ static int conv_compact(struct config *cfg, struct conversation *cv,
      * context window (≈2 bytes per token in CJK-heavy text), keeping the
      * most recent part */
     int64_t window = compact_window_tokens();
-    size_t cap = (size_t)(window > 4096 ? window : 4096) * 2;
+    /* 1.5 bytes per assumed token, not 2: the summarizer's own instruction
+     * and its reply need room too, or the request meant to fix an overflow
+     * overflows on its own */
+    size_t cap = (size_t)((window > 4096 ? window : 4096) * 3 / 2);
     struct buf head = BUF_INIT;
     for (size_t i = 0; i < cut; i++) {
         const struct message *m = &cv->msgs.p[i];
@@ -9587,6 +9622,15 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             if (!compacted_once && !st.content.len && !st.reasoning.len
                 && error_is_context_overflow(st.error)) {
                 out_puts("⚠ 上下文超限，尝试压缩后重试\r\n");
+                /* the rejection usually states the real ceiling; if it does
+                 * not, back off by half and let the next attempt measure */
+                int64_t real = parse_context_limit(st.error);
+                int64_t was = compact_window_tokens();
+                if (!adopt_window_tokens(real))
+                    adopt_window_tokens(was / 2);
+                if (compact_window_tokens() != was)
+                    out_printf("  窗口改用 %lld token\r\n",
+                               (long long)compact_window_tokens());
                 int recovered = conv_compact(cfg, cv, slog);
                 if (!recovered)
                     recovered = conv_stub_tool_results(cv, NULL);
