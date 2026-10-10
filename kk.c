@@ -1296,7 +1296,6 @@ static int g_dock;              /* REPL dock active: pin composer during turns *
  * stale — both are benign by construction. */
 static char *g_status_model; /* own copy: the model name for the status row */
 static int64_t g_ctx_tokens; /* last API-reported prompt tokens (0=unknown) */
-static volatile LONG g_painted; /* first stream byte painted this turn */
 
 static void out_write_unlocked(const char *s, size_t n)
 {
@@ -3651,7 +3650,6 @@ static struct renderer g_renderer;
 static void hook_think(const char *s, size_t n)
 {
     InterlockedExchange(&g_busy, 2);
-    InterlockedExchange(&g_painted, 1);
     g_stream_bytes += (unsigned long long)n;
     renderer_think(&g_renderer, s, n);
 }
@@ -3659,7 +3657,6 @@ static void hook_think(const char *s, size_t n)
 static void hook_text(const char *s, size_t n)
 {
     InterlockedExchange(&g_busy, 2);
-    InterlockedExchange(&g_painted, 1);
     g_stream_bytes += (unsigned long long)n;
     renderer_text(&g_renderer, s, n);
 }
@@ -6439,6 +6436,21 @@ struct session_log {
     char *path;
 };
 
+/* Point %LOCALAPPDATA%\kk\current at the session --continue should reopen:
+ * every place a log becomes the active one writes this same pointer. */
+static void session_point_current(const char *path)
+{
+    char *cur = xasprintf("%s\\current", g_localapp_dir);
+    HANDLE cf = CreateFileA(cur, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+    if (cf != INVALID_HANDLE_VALUE) {
+        DWORD wrote = 0;
+        WriteFile(cf, path, (DWORD)strlen(path), &wrote, NULL);
+        CloseHandle(cf);
+    }
+    free(cur);
+}
+
 /* Open the log on its first record. A launch that never sends a message
  * then leaves no 0-byte session behind, and `current` keeps naming the
  * newest session that actually has content for --continue. */
@@ -6451,15 +6463,7 @@ static void session_touch(struct session_log *sl)
     if (f == INVALID_HANDLE_VALUE)
         return;
     sl->file = f;
-    char *cur = xasprintf("%s\\current", g_localapp_dir);
-    HANDLE cf = CreateFileA(cur, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, NULL);
-    if (cf != INVALID_HANDLE_VALUE) {
-        DWORD wrote = 0;
-        WriteFile(cf, sl->path, (DWORD)strlen(sl->path), &wrote, NULL);
-        CloseHandle(cf);
-    }
-    free(cur);
+    session_point_current(sl->path);
 }
 
 static void session_write_line(struct session_log *sl, const char *data,
@@ -6894,16 +6898,7 @@ static int session_switch(struct session_log *slog, struct conversation *cv,
                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (slog->file == INVALID_HANDLE_VALUE)
         slog->file = NULL; /* session_touch retries the open per record */
-    /* make --continue follow the resumed session */
-    char *cur = xasprintf("%s\\current", g_localapp_dir);
-    HANDLE cf = CreateFileA(cur, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, NULL);
-    if (cf != INVALID_HANDLE_VALUE) {
-        DWORD wrote = 0;
-        WriteFile(cf, path, (DWORD)strlen(path), &wrote, NULL);
-        CloseHandle(cf);
-    }
-    free(cur);
+    session_point_current(path); /* make --continue follow the resumed session */
     return 0;
 }
 
@@ -7175,10 +7170,8 @@ static void skill_describe(const char *dir, const char *dname, struct buf *out,
         buf_append_n(out, desc, dlen);
         if (clipped)
             buf_appends(out, "\xE2\x80\xA6"); /* …: the body is one read away */
-        buf_appends(out, "\n  \xE2\x86\x92 read "); /* → */
-    } else {
-        buf_appends(out, "\n  \xE2\x86\x92 read ");
     }
+    buf_appends(out, "\n  \xE2\x86\x92 read "); /* → */
     buf_appends(out, path);
     buf_appends(out, "\n");
     free(name);
@@ -7427,11 +7420,11 @@ static void edit_rule_append(struct buf *frame)
     static int rule_cols;
     if (rule_cols != g_term_cols) {
         buf_reset(&rule);
-        buf_appends(&rule, vt_or("\x1b[2m\x1b[31m", ""));
-        const char *dash = vt_or("─", "-");
+        /* the editor renders only when docked, which requires VT */
+        buf_appends(&rule, "\x1b[2m\x1b[31m");
         for (int i = 0; i < g_term_cols; i++)
-            buf_appends(&rule, dash);
-        buf_appends(&rule, vt_or("\x1b[0m", ""));
+            buf_appends(&rule, "─");
+        buf_appends(&rule, "\x1b[0m");
         rule_cols = g_term_cols;
     }
     buf_append_n(frame, rule.p, rule.len);
@@ -7629,12 +7622,12 @@ static void edit_render(struct editor *e)
     }
     if (hint) {
         buf_appends(&frame, "\r\n");
-        buf_appends(&frame, vt_or("\x1b[2m\x1b[31m", ""));
+        buf_appends(&frame, "\x1b[2m\x1b[31m");
         if (above > 0)
             buf_appendf(&frame, "↑%d ", above);
         if (below > 0)
             buf_appendf(&frame, "↓%d ", below);
-        buf_appends(&frame, vt_or("more\x1b[0m", "more"));
+        buf_appends(&frame, "more\x1b[0m");
         buf_appends(&frame, "\x1b[0K");
     }
     buf_appends(&frame, "\r\n");
@@ -7928,8 +7921,6 @@ static int edit_menu_candidate(const struct editor *e)
  * cursor back on the draft. */
 static void edit_menu_draw(struct editor *e)
 {
-    if (!g_emit_vt)
-        return;
     if ((int)g_busy != 0) {
         /* the menu captures transcript rows a live turn scrolls under
          * it — restore would paste stale pixels over new content */
@@ -7939,7 +7930,7 @@ static void edit_menu_draw(struct editor *e)
     int match[KK_N_COMMANDS];
     int count = 0;
     if (edit_menu_candidate(e)) {
-        for (size_t k = 0; k < KK_N_COMMANDS && count < KK_N_COMMANDS; k++) {
+        for (size_t k = 0; k < KK_N_COMMANDS; k++) {
             const char *name = KK_COMMANDS[k].name;
             if (e->text.len <= strlen(name)
                 && memcmp(name, e->text.p, e->text.len) == 0)
@@ -8760,6 +8751,27 @@ static int conv_compact(struct config *cfg, struct conversation *cv,
 /* section 9 REPL: the startup banner (reused by /new / /resume resets) */
 static void repl_banner(void);
 
+/* The tail every /resume path shares: switch and replay on success, or
+ * fall back to a fresh session when the log will not load. Silent on the
+ * internals — the caller owns the notice's exact wording. */
+static void resume_finish(struct session_log *slog, struct conversation *cv,
+                          const char *path)
+{
+    if (session_switch(slog, cv, path) == 0) {
+        session_reset_screen();
+        conv_replay(cv);
+        if (g_emit_vt)
+            out_printf("\x1b[2m已切换到会话 %s（%zu 条消息）\x1b[0m\r\n",
+                       path, cv->msgs.n);
+        else
+            out_printf("已切换到会话 %s（%zu 条消息）\r\n", path, cv->msgs.n);
+    } else {
+        session_reset_screen();
+        repl_banner();
+        out_puts("会话读取失败，已开启新会话\r\n");
+    }
+}
+
 static int cmd_slash(struct config *cfg, const char *line,
                      struct conversation *cv, struct session_log *slog)
 {
@@ -8803,26 +8815,12 @@ static int cmd_slash(struct config *cfg, const char *line,
             /* interactive: the full-screen picker */
             char pick[MAX_PATH];
             int got = session_pick(pick, sizeof pick);
-            if (got > 0) {
-                if (session_switch(slog, cv, pick) == 0) {
-                    session_reset_screen();
-                    conv_replay(cv);
-                    if (g_emit_vt)
-                        out_printf("\x1b[2m已切换到会话 %s（%zu 条消息）\x1b[0m\r\n",
-                                   pick, cv->msgs.n);
-                    else
-                        out_printf("已切换到会话 %s（%zu 条消息）\r\n", pick,
-                                   cv->msgs.n);
-                } else {
-                    session_reset_screen();
-                    repl_banner();
-                    out_puts("会话读取失败，已开启新会话\r\n");
-                }
-            } else if (got == 0) {
+            if (got > 0)
+                resume_finish(slog, cv, pick);
+            else if (got == 0)
                 out_puts("已取消\r\n");
-            } else {
+            else
                 out_puts("还没有可切换的会话\r\n");
-            }
             return 1;
         }
         if (!*arg) {
@@ -8849,16 +8847,7 @@ static int cmd_slash(struct config *cfg, const char *line,
             free(paths);
             return 1;
         }
-        if (session_switch(slog, cv, paths[pick - 1]) == 0) {
-            session_reset_screen();
-            conv_replay(cv);
-            out_printf("已切换到会话 %s（%zu 条消息）\r\n", paths[pick - 1],
-                       cv->msgs.n);
-        } else {
-            session_reset_screen();
-            repl_banner();
-            out_puts("会话读取失败，已开启新会话\r\n");
-        }
+        resume_finish(slog, cv, paths[pick - 1]);
         free(paths);
         return 1;
     }
@@ -8961,9 +8950,7 @@ static int run_repl(struct config *cfg)
         enum edit_result er;
         if (dock) {
             term_size_refresh();
-            if (dock_row != g_term_rows) {
-                dock_row = g_term_rows; /* re-anchor after a resize */
-            }
+            dock_row = g_term_rows; /* re-anchor after a resize */
             /* the composer panel owns the docked bottom rows */
             er = edit_line(&ed, &line);
         } else if (g_console_in) {
@@ -9573,7 +9560,6 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     /* turn-level state: spinner and timer run for the whole turn (all
      * model rounds + tool executions), not per round */
     InterlockedExchange(&g_busy, 1);
-    InterlockedExchange(&g_painted, 0);
     g_turn_start = GetTickCount();
     g_stream_bytes = 0;
     if (g_dock)
@@ -9589,7 +9575,6 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         struct stream_hooks hooks = { hook_think, hook_text };
 
         InterlockedExchange(&g_cancel, 0);
-        InterlockedExchange(&g_painted, 0);
         g_stream_bytes = 0;
         g_gen_tool[0] = '\0';
         g_gen_len = g_gen_lines = 0;
@@ -9615,7 +9600,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             if (!retryable)
                 break;
             if (st.content.len || st.reasoning.len || st.n_calls
-                || InterlockedCompareExchange(&g_painted, 0, 0))
+                || g_stream_bytes)
                 break; /* a partial stream must not be replayed */
             if (++attempt >= 3)
                 break;
@@ -9637,7 +9622,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             st.error = NULL;
             st.finish = FINISH_NONE;
         }
-        if (!g_painted && g_emit_vt)
+        if (!g_stream_bytes && g_emit_vt)
             out_puts("\r\x1b[0K"); /* erase the wait spinner residue */
         renderer_end_turn(&g_renderer);
 
