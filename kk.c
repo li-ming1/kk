@@ -3761,6 +3761,10 @@ struct stream_state {
     int got_usage;
     size_t request_bytes; /* serialized request size, for the no-usage
                            * compaction estimate */
+    size_t request_shared; /* leading bytes identical to this process's
+                            * previous request: the prefix-cache diagnostic */
+    int request_prev;      /* 0 on the first round, where there is nothing
+                            * to compare against */
     char *error; /* heap; set when the API reported an error */
     int looped;     /* output collapsed into repetition: the stream aborts */
     size_t loop_next; /* content length at which the next scan is due */
@@ -6498,10 +6502,13 @@ static void session_log_message(struct session_log *sl,
 /* One record per API ROUND, not per user turn: the on-screen `ch` sums the
  * whole turn, so it cannot tell a cold first round from an unstable prefix.
  * cache_tokens is omitted when the endpoint reports none, which keeps the
- * line byte-identical to the old format for those providers. */
+ * line byte-identical to the old format for those providers. req/shared are
+ * the request size and how many leading bytes repeated the previous round —
+ * the pair that separates "our prefix moved" from "their cache is cold". */
 static void session_log_usage(struct session_log *sl, int64_t prompt,
                               int64_t completion, int64_t cache,
-                              int has_cache)
+                              int has_cache, size_t req, size_t shared,
+                              int has_prev)
 {
     if (!sl->path)
         return;
@@ -6509,10 +6516,15 @@ static void session_log_usage(struct session_log *sl, int64_t prompt,
     cf[0] = '\0';
     if (has_cache)
         snprintf(cf, sizeof cf, ",\"cache_tokens\":%lld", (long long)cache);
-    char line[128];
+    char rq[64];
+    rq[0] = '\0';
+    if (has_prev)
+        snprintf(rq, sizeof rq, ",\"req\":%zu,\"shared\":%zu", req, shared);
+    char line[192];
     int n = snprintf(line, sizeof line,
-                     "{\"type\":\"usage\",\"prompt_tokens\":%lld,\"completion_tokens\":%lld%s}",
-                     (long long)prompt, (long long)completion, cf);
+                     "{\"type\":\"usage\",\"prompt_tokens\":%lld,"
+                     "\"completion_tokens\":%lld%s%s}",
+                     (long long)prompt, (long long)completion, cf, rq);
     if (n > 0 && n < (int)sizeof line - 1) {
         line[n++] = '\n';
         session_write_line(sl, line, (size_t)n);
@@ -9230,6 +9242,21 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
 
     char *err_body = NULL;
     st->request_bytes = body.len;
+    /* prefix-cache diagnostics: how much of this request repeats the
+     * previous one byte-for-byte from the very first byte. A small `shared`
+     * on a big body is our own instability; a big `shared` with
+     * `cache_tokens` still 0 is the endpoint's. */
+    {
+        static struct buf prev_body;
+        size_t cmp = body.len < prev_body.len ? body.len : prev_body.len;
+        size_t sh = 0;
+        st->request_prev = prev_body.len != 0;
+        while (sh < cmp && body.p[sh] == prev_body.p[sh])
+            sh++;
+        st->request_shared = sh;
+        buf_reset(&prev_body);
+        buf_append_n(&prev_body, body.p, body.len);
+    }
     int status = http_post_stream(url, cfg->api_key, body.p, 10000, 120000,
                                   sse_on_bytes, &cr, &err_body);
     if (status == 0 && err_body) {
@@ -9593,6 +9620,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     int64_t turn_in = 0, turn_out = 0, turn_cache = 0;
     DWORD gen_ms = 0; /* time inside chat_stream, across every round */
     int turn_usage = 0, turn_has_cache = 0;
+    size_t turn_req = 0, turn_shared = 0; /* last round's prefix numbers */
+    int turn_prev = 0;
     size_t last_request_bytes = 0;
     int compacted_once = 0;
     /* turn-level state: spinner and timer run for the whole turn (all
@@ -9733,8 +9762,15 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 turn_cache += st.cache_tokens;
                 turn_has_cache = 1;
             }
+            /* the prefix numbers describe the LAST round only: that is the
+             * one whose cache state the next round inherits */
+            turn_req = st.request_bytes;
+            turn_shared = st.request_shared;
+            turn_prev = st.request_prev;
             session_log_usage(slog, st.prompt_tokens, st.completion_tokens,
-                              st.cache_tokens, st.has_cache);
+                              st.cache_tokens, st.has_cache,
+                              st.request_bytes, st.request_shared,
+                              st.request_prev);
         }
         if (st.finish != FINISH_TOOL_CALLS || st.n_calls == 0) {
             /* no tool will run, so nothing will clear the generation
@@ -9958,15 +9994,25 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         /* percent to one decimal: 1-2% hits are common on short turns and
          * rounding them to 0% reads as "caching is broken" */
         int64_t ch10 = turn_in > 0 ? turn_cache * 1000 / turn_in : 0;
+        /* sh: how much of the last request repeated the previous one from
+         * byte 0. High sh with ch 0 points at the endpoint; a falling sh
+         * points at us (something in the prefix moved). */
+        char shp[32];
+        shp[0] = '\0';
+        if (turn_prev && turn_req > 0) {
+            int64_t sh10 = (int64_t)(turn_shared * 1000 / turn_req);
+            snprintf(shp, sizeof shp, " · sh %lld.%d%%",
+                     (long long)(sh10 / 10), (int)(sh10 % 10));
+        }
         if (g_emit_vt)
             out_puts("\x1b[2m");
         if (turn_has_cache && turn_in > 0)
-            out_printf("[in %lld · out %lld%s · ch %lld.%d%% · %s]\r\n",
+            out_printf("[in %lld · out %lld%s · ch %lld.%d%%%s · %s]\r\n",
                        (long long)turn_in, (long long)turn_out, tps,
-                       (long long)(ch10 / 10), (int)(ch10 % 10), fs);
+                       (long long)(ch10 / 10), (int)(ch10 % 10), shp, fs);
         else
-            out_printf("[in %lld · out %lld%s · %s]\r\n", (long long)turn_in,
-                       (long long)turn_out, tps, fs);
+            out_printf("[in %lld · out %lld%s%s · %s]\r\n", (long long)turn_in,
+                       (long long)turn_out, tps, shp, fs);
         if (g_emit_vt)
             out_puts("\x1b[0m");
         out_puts("\r\n");
