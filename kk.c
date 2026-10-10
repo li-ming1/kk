@@ -9890,6 +9890,10 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         size_t n_para = 0;
         while (n_para < n_calls && strcmp(calls[n_para].name, "read") == 0)
             n_para++;
+        if (n_para < 2)
+            n_para = 0; /* one read gains nothing from a thread, and every
+                         * `i < n_para` below indexes the slot array that only
+                         * the >=2 branch allocates */
         struct para_slot *para = NULL;
         if (n_para >= 2) {
             para = xcalloc(n_para, sizeof *para);
@@ -10187,10 +10191,18 @@ static LONG WINAPI kk_crash_filter(EXCEPTION_POINTERS *ep)
             pMiniDump(GetCurrentProcess(), f, GetCurrentProcessId(),
                       MiniDumpNormal, &mei, NULL, NULL);
         CloseHandle(f);
-        WriteFile(GetStdHandle(STD_ERROR_HANDLE),
-                  "\r\nkk crashed: dump written to kk_crash.dmp\r\n", 46,
-                  &(DWORD){0}, NULL);
     }
+    /* the dump is the expensive answer and it can come out empty (a wedged
+     * pipe, a stack overflow); the code plus address names the fault on
+     * their own once kk.pdb is at hand */
+    char msg[128];
+    int n = snprintf(msg, sizeof msg,
+                      "\r\nkk crashed: code 0x%08lX at %p%s\r\n",
+                      (unsigned long)ep->ExceptionRecord->ExceptionCode,
+                      ep->ExceptionRecord->ExceptionAddress,
+                      f != INVALID_HANDLE_VALUE ? " (kk_crash.dmp)" : "");
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, (DWORD)n, &(DWORD){0},
+              NULL);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
