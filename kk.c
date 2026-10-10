@@ -6638,13 +6638,6 @@ static int session_load(const char *path, struct conversation *cv)
                     if (summary)
                         conv_prepend_user(cv, summary);
                 }
-            } else if (type && type->tag == J_STR
-                       && str_eqc(type->raw, "truncate")) {
-                /* legacy logs (removed /undo): keep the first N messages */
-                struct jnode *k = jobj_get(v, "keep");
-                size_t keep = k && k->tag == J_NUM ? (size_t)jnum_i(k) : 0;
-                if (keep < cv->msgs.n)
-                    conv_truncate(cv, keep);
             }
         }
         p = nl ? nl + 1 : p + llen;
@@ -7041,7 +7034,6 @@ static char *load_agents_md(void)
 
 #define SKILL_ROOT_MAX  2
 #define SKILL_MAX       32
-#define SKILL_NAME_MAX  64
 #define SKILL_DESC_MAX  600  /* these descriptions are written for routing;
                               * cutting them short costs the "use when" half */
 #define SKILL_HEAD_MAX  16384 /* only the frontmatter is ever looked at */
