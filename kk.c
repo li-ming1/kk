@@ -9177,7 +9177,34 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
     buf_reserve(&body, last_body + 4096);
     buf_appends(&body, "{\"model\":\"");
     json_escape_append(&body, cfg->model, strlen(cfg->model));
-    buf_appends(&body, "\",\"messages\":[");
+    if (with_tools) {
+        /* The tool schema block is a compile-time constant: escape once.
+         * It sits AHEAD of `messages` on purpose. Prompt caching is a
+         * *prefix* cache, and every round appends inside the messages
+         * array: last in the body these 4.7KB of unchanging text could
+         * never fall inside a shared prefix. JSON key order carries no
+         * meaning for the API, only for the byte-level prefix. */
+        static struct buf tools_json;
+        if (!tools_json.len) {
+            for (size_t ti = 0; ti < KK_N_TOOLS; ti++) {
+                if (ti)
+                    buf_appends(&tools_json, ",");
+                buf_appends(&tools_json,
+                            "{\"type\":\"function\",\"function\":{\"name\":\"");
+                buf_appends(&tools_json, KK_TOOLS[ti].name);
+                buf_appends(&tools_json, "\",\"description\":\"");
+                json_escape_append(&tools_json, KK_TOOLS[ti].description,
+                                   strlen(KK_TOOLS[ti].description));
+                buf_appends(&tools_json,
+                            "\",\"parameters\":{\"type\":\"object\",\"properties\":");
+                buf_appends(&tools_json, KK_TOOLS[ti].params);
+                buf_appends(&tools_json, "}}}");
+            }
+        }
+        buf_appends(&body, "\",\"tools\":[");
+        buf_append_n(&body, tools_json.p, tools_json.len);
+    }
+    buf_appends(&body, with_tools ? "],\"messages\":[" : "\",\"messages\":[");
     int first = 1;
     if (system_prompt && *system_prompt) {
         /* the escaped system fragment is cached per source pointer: the
@@ -9199,28 +9226,6 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
             buf_appends(&body, ",");
         first = 0;
         msg_append_json(&body, &cv->msgs.p[i]);
-    }
-    if (with_tools) {
-        /* the tool schema block is a compile-time constant: escape once */
-        static struct buf tools_json;
-        if (!tools_json.len) {
-            for (size_t ti = 0; ti < KK_N_TOOLS; ti++) {
-                if (ti)
-                    buf_appends(&tools_json, ",");
-                buf_appends(&tools_json,
-                            "{\"type\":\"function\",\"function\":{\"name\":\"");
-                buf_appends(&tools_json, KK_TOOLS[ti].name);
-                buf_appends(&tools_json, "\",\"description\":\"");
-                json_escape_append(&tools_json, KK_TOOLS[ti].description,
-                                   strlen(KK_TOOLS[ti].description));
-                buf_appends(&tools_json,
-                            "\",\"parameters\":{\"type\":\"object\",\"properties\":");
-                buf_appends(&tools_json, KK_TOOLS[ti].params);
-                buf_appends(&tools_json, "}}}");
-            }
-        }
-        buf_appends(&body, "],\"tools\":[");
-        buf_append_n(&body, tools_json.p, tools_json.len);
     }
     buf_appendf(&body,
                 "],\"stream\":true,\"max_tokens\":%lld,"
