@@ -6219,7 +6219,13 @@ static void tool_show_output(const char *output)
     /* skip the "exit N" first line; trim blank edges (shells pad); the
      * rest is dim-indented two columns, batched into one console write */
     const char *nl = strchr(output, '\n');
-    const char *body = nl ? nl + 1 : output;
+    /* Everything shown here is the *rest* of the output: tool_show_exit
+     * already printed the first line. A single-line result — write's
+     * "wrote N bytes to path", any error string — has no rest, and
+     * falling back to the whole buffer printed that line twice. */
+    if (!nl)
+        return;
+    const char *body = nl + 1;
     const char *end = body + strlen(body);
     while (end > body && (end[-1] == '\n' || end[-1] == '\r'
                           || end[-1] == ' ' || end[-1] == '\t'))
