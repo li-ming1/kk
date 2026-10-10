@@ -2246,8 +2246,6 @@ static void painter_screen(struct painter *p)
         p->shown = p->pending.len;
     }
     p->row_shown = 1;
-    if (g_dock && g_busy)
-        status_repaint(); /* keep the status row fresh */
 }
 
 /* Commit the pending row: sync the screen and end the line. The row
