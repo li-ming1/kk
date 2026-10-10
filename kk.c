@@ -5371,7 +5371,10 @@ static char *tool_read(const struct jnode *args, struct tool_img *img)
     if (offset < 1)
         offset = 1;
     if (limit < 1)
-        limit = 2000; /* the emit compare casts to size_t: -1 means no cap */
+        limit = 2000; /* the emit compare casts to size_t, so a negative
+                       * limit would wrap into a huge cap: an omitted or
+                       * non-positive limit means the default, never
+                       * "everything" */
 
     /* refuse sizes file_read_all would refuse, but with an honest
      * message: a silent "cannot read" on a file that plainly exists
@@ -9304,9 +9307,6 @@ static int error_is_context_overflow(const char *err)
     return 0;
 }
 
-/* Configured context window in tokens (KK_CONTEXT_WINDOW, default 128k).
- * The auto-compact trigger and the summarizer's input budget derive
- * from it. */
 /* Assumed context window in tokens: KK_CONTEXT_WINDOW over a 256k default.
  * Corrected downward at runtime when an overflow rejection tells us the real
  * limit — guessing high is only safe because that correction exists. */
