@@ -4211,20 +4211,27 @@ static void msg_serialize(struct buf *b, const struct message *m, int wire)
 
 /* --- tool specs --------------------------------------------------------- */
 
+/* Image attachment a tool produced alongside its text output; owned by the
+ * caller, moved into the tool-result message. */
+struct tool_img {
+    char *b64;
+    char *mime;
+};
+
 struct tool_spec {
     const char *name;
     const char *description;
     const char *params;       /* JSON Schema "properties" object */
-    char *(*exec)(const struct jnode *args);
+    char *(*exec)(const struct jnode *args, struct tool_img *img);
     const char *summary_key;  /* arg shown on the ● line */
     int quiet_ok;             /* 1: successful output stays model-only */
 };
 
-static char *tool_read(const struct jnode *args);
-static char *tool_write(const struct jnode *args);
-static char *tool_bash(const struct jnode *args);
-static char *tool_find(const struct jnode *args);
-static char *tool_grep(const struct jnode *args);
+static char *tool_read(const struct jnode *args, struct tool_img *img);
+static char *tool_write(const struct jnode *args, struct tool_img *img);
+static char *tool_bash(const struct jnode *args, struct tool_img *img);
+static char *tool_find(const struct jnode *args, struct tool_img *img);
+static char *tool_grep(const struct jnode *args, struct tool_img *img);
 
 /* the tool registry: adding a tool is one row here plus its exec fn */
 static const struct tool_spec KK_TOOLS[] = {
@@ -4805,8 +4812,9 @@ static void buf_append_line_capped(struct buf *out, const char *s, size_t n)
     buf_appendc(out, '\n');
 }
 
-static char *tool_find(const struct jnode *args)
+static char *tool_find(const struct jnode *args, struct tool_img *img_)
 {
+    (void)img_; /* only read attaches images */
     char *query = jstr_dupz(jobj_get(args, "query"));
     char *glob = jstr_dupz(jobj_get(args, "glob"));
     if (glob && !*glob) {
@@ -4887,8 +4895,9 @@ static void grep_context_line(struct buf *out, const char *text)
     buf_append_line_capped(out, text ? text : "", text ? strlen(text) : 0);
 }
 
-static char *tool_grep(const struct jnode *args)
+static char *tool_grep(const struct jnode *args, struct tool_img *img_)
 {
+    (void)img_; /* only read attaches images */
     char *query = jstr_dupz(jobj_get(args, "query"));
     if (!query || !*query) {
         free(query);
@@ -4964,11 +4973,6 @@ static char *tool_grep(const struct jnode *args)
 /* --- read ---------------------------------------------------------------- */
 
 static char *b64_encode(const char *data, size_t n);
-
-/* tool_read hands an image attachment to the tool-result message through
- * here (tools run sequentially on the agent thread, no lock needed). */
-static char *g_tool_image_b64;
-static char *g_tool_image_mime;
 
 static const char *image_mime_of(struct str path, const char *data,
                                  size_t len);
@@ -5346,7 +5350,7 @@ static size_t read_line_prefix(char *dst, size_t line_no)
     return o;
 }
 
-static char *tool_read(const struct jnode *args)
+static char *tool_read(const struct jnode *args, struct tool_img *img)
 {
     struct args a;
     args_init(&a, args);
@@ -5401,11 +5405,8 @@ static char *tool_read(const struct jnode *args)
      * to the tool-result message as base64 for vision models */
     const char *mime = image_mime_of(path, data, len);
     if (mime) {
-        char *b64 = b64_encode(data, len);
-        free(g_tool_image_b64);
-        free(g_tool_image_mime);
-        g_tool_image_b64 = b64;
-        g_tool_image_mime = xstrdup(mime);
+        img->b64 = b64_encode(data, len);
+        img->mime = xstrdup(mime);
         buf_appendf(&out, "[image] %.*s (%s, %zu bytes) attached\r\n",
                     (int)path.n, path.p, mime, len);
         result = buf_detach(&out);
@@ -5474,8 +5475,9 @@ static void crlf_fix(struct str s, struct buf *out)
     }
 }
 
-static char *tool_write(const struct jnode *args)
+static char *tool_write(const struct jnode *args, struct tool_img *img_)
 {
+    (void)img_; /* only read attaches images */
     struct args a;
     args_init(&a, args);
     struct str path = args_get(&a, "path");
@@ -6153,8 +6155,9 @@ static int shell_run(struct str command,
 
 /* --- dispatch ------------------------------------------------------------ */
 
-static char *tool_bash(const struct jnode *args)
+static char *tool_bash(const struct jnode *args, struct tool_img *img_)
 {
+    (void)img_; /* only read attaches images */
     struct args a;
     args_init(&a, args);
     struct str command = args_get(&a, "command");
@@ -6218,10 +6221,11 @@ static char *tool_bash(const struct jnode *args)
     return result;
 }
 
-static char *tool_execute(const char *name, const struct jnode *args)
+static char *tool_execute(const char *name, const struct jnode *args,
+                          struct tool_img *img)
 {
     const struct tool_spec *ts = tool_lookup(name);
-    char *result = ts ? ts->exec(args) : NULL;
+    char *result = ts ? ts->exec(args, img) : NULL;
     if (!result)
         result = ts ? xstrdup("error: tool failed")
                     : xasprintf("error: unknown tool '%s'", name);
@@ -8693,7 +8697,7 @@ static char *workspace_snapshot(void)
     struct jnode *args = json_parse(&a, "{}", 2);
     /* an argument-less find is the list mode; it skips fff.track, so seeding
      * the prompt never skews the ranking it reads */
-    char *listing = args ? tool_find(args) : NULL;
+    char *listing = args ? tool_find(args, NULL) : NULL;
     arena_free(&a);
     if (!listing || strncmp(listing, "error:", 6) == 0) {
         free(listing);
@@ -9540,6 +9544,40 @@ static int queue_pending(void)
     return has;
 }
 
+/* One parallel read call: parse + execute on its own thread, filling the
+ * slot the agent loop reaps in call order. */
+struct para_slot {
+    const char *name;
+    const char *args_json;
+    char *output;
+    struct tool_img img;
+    char *summary;
+    HANDLE th;
+    struct arena ta;
+};
+
+static DWORD WINAPI para_read_thread(LPVOID arg)
+{
+    struct para_slot *s = arg;
+    arena_init(&s->ta, 8 * 1024);
+    struct jnode *aj = json_parse(&s->ta, s->args_json,
+                                  strlen(s->args_json));
+    if (aj && aj->tag != J_OBJ)
+        aj = NULL;
+    s->summary = aj ? args_summary(aj, s->name) : xstrdup("");
+    s->output = tool_execute(s->name, aj, &s->img);
+    return 0;
+}
+
+static void para_slot_free(struct para_slot *s)
+{
+    free(s->output);
+    free(s->summary);
+    free(s->img.b64);
+    free(s->img.mime);
+    arena_free(&s->ta);
+}
+
 /* One agent turn: stream, execute tool calls, feed results back. The
  * real cursor stays hidden for the whole turn — streaming repaints the
  * tail every frame, and a visible cursor just jumps around the output;
@@ -9748,40 +9786,99 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
          * reads 1 (waiting): the spinner must go quiet before the tool
          * lines print, or it stamps over them */
         InterlockedExchange(&g_busy, 2);
+        /* Leading read-only calls run in parallel: the model emits them in
+         * one batch precisely because they are independent, and a read is a
+         * pure I/O wait. Only the leading run of reads qualifies — a read
+         * sitting behind a write in the same batch may be meant to see that
+         * write's result. Results still join, display and log in call order:
+         * display == model view. */
+        size_t n_para = 0;
+        while (n_para < n_calls && strcmp(calls[n_para].name, "read") == 0)
+            n_para++;
+        struct para_slot *para = NULL;
+        if (n_para >= 2) {
+            para = xcalloc(n_para, sizeof *para);
+            for (size_t k = 0; k < n_para; k++) {
+                para[k].name = calls[k].name;
+                para[k].args_json = calls[k].args;
+                para[k].th = CreateThread(NULL, 0, para_read_thread,
+                                          &para[k], 0, NULL);
+                if (!para[k].th) {
+                    /* thread starvation: drain what did start and fall back
+                     * to the serial path — reads are pure, re-running them
+                     * is harmless */
+                    for (size_t j = 0; j < n_para; j++) {
+                        if (para[j].th) {
+                            WaitForSingleObject(para[j].th, INFINITE);
+                            CloseHandle(para[j].th);
+                        }
+                        para_slot_free(&para[j]);
+                    }
+                    free(para);
+                    para = NULL;
+                    n_para = 0;
+                    break;
+                }
+            }
+            /* one label for the whole parallel burst: naming a single tool
+             * while N run would be a lie, and silence would read as a hang */
+            if (para) {
+                AcquireSRWLockExclusive(&g_out_lock);
+                snprintf(g_tick_label, sizeof g_tick_label, "并行 read ×%zu",
+                         n_para);
+                g_tick_start = GetTickCount();
+                ReleaseSRWLockExclusive(&g_out_lock);
+            }
+        }
         /* execute every call: full display, full output to the model */
         int cancelled = 0;
         for (size_t i = 0; i < n_calls; i++) {
             const char *name = calls[i].name;
-            const char *args_json = calls[i].args;
 
-            struct arena ta;
-            arena_init(&ta, 8 * 1024);
-            struct jnode *aj = json_parse(&ta, args_json, strlen(args_json));
-            if (aj && aj->tag != J_OBJ)
-                aj = NULL;
-            char *summary = aj ? args_summary(aj, name) : xstrdup("");
-            tool_show_call(name, summary);
+            char *output;
+            struct tool_img img = { NULL, NULL };
+            char *summary;
+            if (i < n_para) {
+                /* reap the parallel read in call order: every thread was
+                 * launched above, so this is a join, not a fresh start */
+                WaitForSingleObject(para[i].th, INFINITE);
+                CloseHandle(para[i].th);
+                para[i].th = NULL;
+                summary = para[i].summary;
+                tool_show_call(name, summary);
+                output = para[i].output;
+                img = para[i].img;
+                arena_free(&para[i].ta); /* the output is heap, not arena */
+            } else {
+                struct arena ta;
+                arena_init(&ta, 8 * 1024);
+                struct jnode *aj = json_parse(&ta, calls[i].args,
+                                              strlen(calls[i].args));
+                if (aj && aj->tag != J_OBJ)
+                    aj = NULL;
+                summary = aj ? args_summary(aj, name) : xstrdup("");
+                tool_show_call(name, summary);
 
-            /* the status line carries the running tool's name and args */
-            AcquireSRWLockExclusive(&g_out_lock);
-            snprintf(g_tick_label, sizeof g_tick_label, "%s · %s", name,
-                     summary);
-            g_tick_start = GetTickCount();
-            ReleaseSRWLockExclusive(&g_out_lock);
-            /* the args are already parsed: executing on the same node
-             * skips a second full JSON pass (a write's content alone can
-             * be 100KB); the arena owns aj and must outlive the call */
-            char *output = tool_execute(name, aj);
-            /* tool_read hands images here for the tool-result message */
-            char *img_b64 = g_tool_image_b64;
-            char *img_mime = g_tool_image_mime;
-            g_tool_image_b64 = NULL;
-            g_tool_image_mime = NULL;
-            AcquireSRWLockExclusive(&g_out_lock);
-            g_tick_label[0] = '\0';
-            ReleaseSRWLockExclusive(&g_out_lock);
+                /* the status line carries the running tool's name and args */
+                AcquireSRWLockExclusive(&g_out_lock);
+                snprintf(g_tick_label, sizeof g_tick_label, "%s · %s", name,
+                         summary);
+                g_tick_start = GetTickCount();
+                ReleaseSRWLockExclusive(&g_out_lock);
+                /* the args are already parsed: executing on the same node
+                 * skips a second full JSON pass (a write's content alone can
+                 * be 100KB); the arena owns aj and must outlive the call */
+                output = tool_execute(name, aj, &img);
+                arena_free(&ta);
+            }
+            /* the burst label survives every reap: only the last one (or a
+             * serial tool finishing) clears it */
+            if (i >= n_para || i + 1 == n_para) {
+                AcquireSRWLockExclusive(&g_out_lock);
+                g_tick_label[0] = '\0';
+                ReleaseSRWLockExclusive(&g_out_lock);
+            }
             free(summary);
-            arena_free(&ta);
             const struct tool_spec *ts = tool_lookup(name);
             if (ts && ts->quiet_ok) {
                 /* file content goes to the model only, but read FAILURES
@@ -9796,12 +9893,12 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
 
             struct message *tm = conv_add_take(cv, "tool", output);
             tm->tool_call_id = xstrdup(calls[i].id);
-            if (img_b64 && img_mime) {
-                struct image_part part = { img_mime, img_b64 };
+            if (img.b64 && img.mime) {
+                struct image_part part = { img.mime, img.b64 };
                 DA_PUSH(tm->images, part); /* ownership moves */
             } else {
-                free(img_b64);
-                free(img_mime);
+                free(img.b64);
+                free(img.mime);
             }
             session_log_message(slog, tm);
             if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
@@ -9809,7 +9906,17 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 /* the assistant message holding all N tool_calls is already
                  * committed and logged: every call left unrun needs a tool
                  * message, or the next request is a 400 that --continue
-                 * replays for the rest of the session */
+                 * replays for the rest of the session. Parallel reads that
+                 * already started are drained and discarded — the stub is
+                 * what the model sees for them. */
+                for (size_t j = i + 1; j < n_para; j++) {
+                    if (para[j].th) {
+                        WaitForSingleObject(para[j].th, INFINITE);
+                        CloseHandle(para[j].th);
+                        para[j].th = NULL;
+                    }
+                    para_slot_free(&para[j]);
+                }
                 for (size_t j = i + 1; j < n_calls; j++) {
                     struct message *stub = conv_add(cv, "tool",
                                     "(cancelled before this call ran)");
@@ -9819,6 +9926,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 break;
             }
         }
+        free(para);
         stream_state_free(&st);
         if (cancelled) {
             if (InterlockedCompareExchange(&g_steer, 0, 0)) {
