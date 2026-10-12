@@ -10230,6 +10230,18 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
     }
     free(err_body);
 
+    /* A 200 that carried no event, no finish_reason and no usage chunk is a
+     * provider that accepted the request and closed the response without
+     * answering. Nothing streamed, so report it as a transport failure and
+     * let the caller's backoff retry — a replay duplicates nothing on
+     * screen, and a dead turn otherwise ends with no reply and no error. */
+    if (status == 200 && st->finish == FINISH_NONE && !st->got_usage
+        && !st->content.len && !st->reasoning.len && !st->n_calls) {
+        free(st->error);
+        st->error = xstrdup("connection closed before any data");
+        status = 0;
+    }
+
     /* the diagnostic above already consumed the previous body: keep THIS
      * one for the next round by moving it, not copying it — one full body
      * resident at a time, and its length pre-sizes the next round's build */
@@ -10772,6 +10784,20 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             stream_state_free(&st);
             rc = 1;
             break;
+        }
+        /* A 200 whose stream ended with no finish_reason, no usage chunk
+         * and no [DONE] was closed by the peer mid-answer. The transport
+         * cannot see it — WinHTTP reports a clean EOF either way — so the
+         * reply would sit there stopping mid-word with nothing said, which
+         * reads as a rendering bug. Say it, and leave the fact in the
+         * message the model reads next round: display == model view for
+         * truncation too, and "继续" then continues instead of guessing. */
+        if (status == 200 && st.finish == FINISH_NONE && !st.got_usage
+            && (st.content.len || st.reasoning.len || st.n_calls)) {
+            out_puts("⚠ 回复在传输中被提前关闭，内容不完整\r\n");
+            if (st.content.len)
+                buf_appends(&st.content,
+                            "\n\n[传输中断：此回复未完整接收]");
         }
         if (st.got_usage) {
             /* accumulate: the usage line prints once per user turn */
