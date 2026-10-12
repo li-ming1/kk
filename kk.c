@@ -1537,6 +1537,12 @@ static struct buf g_queued;           /* pending new-input lines, \n separated *
 static volatile LONG g_steer;         /* enter with content: inject + interrupt */
 static char g_tick_label[160];        /* running tool for the status line */
 static DWORD g_tick_start;            /* when the running tool started */
+/* The arguments a tool call is still streaming. A big write can spend
+ * minutes generating its content before the tool ever runs, and a row that
+ * said only "思考中" the whole time reads as a hang, so the status line shows
+ * live bytes and lines. Counters only: the row formats them at paint time. */
+static char g_gen_tool[48];
+static size_t g_gen_len, g_gen_lines;
 
 /* Fixed dock: the composer panel pins to the bottom edge (rule + draft
  * window + hint + rule + status, 4..13 rows tall) and every painter
@@ -1557,12 +1563,24 @@ static void status_line_build(char *line, size_t lcap, char *tail,
     if (busy == 1 && InterlockedCompareExchange(&g_cancel, 0, 0)) {
         snprintf(line, lcap,
                  "\x1b[36m⇣\x1b[0m \x1b[36m正在取消…\x1b[0m");
-    } else if (g_tick_label[0]) {
-        char label[160];
-        trunc_cols(label, sizeof label, g_tick_label,
+    } else if (g_tick_label[0] || (busy == 2 && g_gen_len)) {
+        /* Either a running tool's label or, while a tool call's arguments
+         * are still streaming, the live byte/line counters — formatted here,
+         * once per painted frame, instead of once per delta. */
+        char label[192];
+        if (busy == 2 && g_gen_len) {
+            char fb[24];
+            fmt_bytes(fb, sizeof fb, (unsigned long long)g_gen_len);
+            snprintf(label, sizeof label, "%s · 生成中 %s / %zu 行",
+                     g_gen_tool[0] ? g_gen_tool : "工具", fb, g_gen_lines);
+        } else {
+            snprintf(label, sizeof label, "%s", g_tick_label);
+        }
+        char cut[160];
+        trunc_cols(cut, sizeof cut, label,
                    g_term_cols - 40 > 8 ? g_term_cols - 40 : 8);
         snprintf(line, lcap, "\x1b[36m%s\x1b[0m \x1b[2m%s\x1b[0m",
-                 SPIN_FRAMES[g_frame % 10], label);
+                 SPIN_FRAMES[g_frame % 10], cut);
     } else if (busy == 1) {
         snprintf(line, lcap,
                  "\x1b[36m%s\x1b[0m \x1b[36m思考中\x1b[0m"
@@ -1592,20 +1610,24 @@ static void status_line_build(char *line, size_t lcap, char *tail,
     }
     if (busy) {
         char fs[16];
-        DWORD since = g_tick_label[0] ? g_tick_start : g_turn_start;
+        DWORD since = (g_tick_label[0] || g_gen_len) ? g_tick_start
+                                                     : g_turn_start;
         fmt_secs(fs, sizeof fs, (GetTickCount() - since) / 1000);
         snprintf(tail, tcap, "\x1b[2m · %s\x1b[0m", fs);
     }
 }
 
-/* Progress of the tool-call arguments the model is streaming right now.
- * A big write can spend minutes generating its content before the tool ever
- * runs, and until now the status row said only "思考中" the whole time. */
-static char g_gen_tool[48];
-static size_t g_gen_len, g_gen_lines;
-
 /* args holds the whole accumulated buffer; from is where this delta began,
- * so line counting stays O(new bytes) instead of rescanning per delta. */
+ * so line counting stays O(new bytes) instead of rescanning per delta.
+ *
+ * Counters only, on purpose. This used to format the status label right here,
+ * which cost two snprintf plus an output-lock acquire on every argument
+ * delta: 20,000 times for a 1.4MB streamed file write, against a row the
+ * spinner repaints ~11 times a second — measured as ~10 ms of the 18.7 ms
+ * assembly cost for that stream. status_line_build turns these numbers into
+ * text once per frame that is actually drawn. The spinner may read them one
+ * frame stale, the same benign class as g_ctx_tokens: a byte count 90 ms
+ * behind is still the right number to show. */
 static void gen_progress(const char *tool, const struct buf *args, size_t from)
 {
     if (g_gen_len == 0 && g_gen_lines == 0 && args->len > from)
@@ -1614,14 +1636,8 @@ static void gen_progress(const char *tool, const struct buf *args, size_t from)
         if (*p == '\n')
             g_gen_lines++;
     g_gen_len += args->len - from;
-    char fb[24];
-    fmt_bytes(fb, sizeof fb, (unsigned long long)g_gen_len);
-    AcquireSRWLockExclusive(&g_out_lock);
     if (!g_gen_tool[0] && tool && *tool)
         snprintf(g_gen_tool, sizeof g_gen_tool, "%s", tool);
-    snprintf(g_tick_label, sizeof g_tick_label, "%s · 生成中 %s / %zu 行",
-             g_gen_tool[0] ? g_gen_tool : "工具", fb, g_gen_lines);
-    ReleaseSRWLockExclusive(&g_out_lock);
 }
 
 /* The status line: spinner + phase during waits, live counters while
