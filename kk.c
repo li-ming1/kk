@@ -861,14 +861,20 @@ static int64_t jnum_i(const struct jnode *node)
     return node ? node->inum : 0;
 }
 
-/* Heap-allocated decoded string: callers own it and may free() it. */
+/* A decoded, NUL-terminated copy of a raw (still escaped) JSON string slice.
+ * Distinct from str_dupz(), which copies a slice verbatim. */
+static char *jdecode_dupz(struct str raw)
+{
+    struct buf b = BUF_INIT;
+    jdecode_str(raw, &b);
+    return buf_detach(&b);
+}
+
 static char *jstr_dupz(const struct jnode *node)
 {
     if (!node || node->tag != J_STR)
         return NULL;
-    struct buf b = BUF_INIT;
-    jdecode_str(node->raw, &b);
-    return buf_detach(&b);
+    return jdecode_dupz(node->raw);
 }
 
 /* Decoded string, or a copy of fallback when the node is missing. */
@@ -3953,6 +3959,568 @@ struct chat_request {
     struct arena arena;   /* reused per event */
 };
 
+/* --- the delta fast scan -------------------------------------------------- */
+/* An SSE delta is a fixed envelope, and paying a DOM for it is the most
+ * expensive thing kk does per streamed byte. Measured on a 21,627-event,
+ * 4.4MB stream: building the tree costs 878 ns/event (222 MB/s) while the
+ * framing that copies every byte runs at 5.7 GB/s, and the tree is 90% of the
+ * protocol path's total. About 21 arena nodes — 64 bytes each, zeroed on
+ * allocation — exist only so jobj_get can reach "content".
+ *
+ * The scan below walks the envelope by index and allocates nothing: the keys
+ * the stream uses become slices into the caller's buffer, every other member
+ * is skipped structurally. Wherever it is not certain — an unexpected value
+ * type, an "error" member, a populated "usage", more than FAST_CALLS calls in
+ * one event, malformed bytes — it returns 0 and the general parser handles
+ * the event. The DOM path therefore stays the definition of the protocol; the
+ * fast scan only ever has to match it, never replace it. Both then feed the
+ * same three appliers below, so nothing is implemented twice. */
+#define FAST_CALLS 4
+
+struct call_delta {
+    int64_t index;
+    int has_index;  /* the member existed: the DOM reads a null index as 0 */
+    int id_key, name_key, args_key; /* the key appeared: jobj_get stops at the
+                                     * first one, whatever it holds */
+    struct str id, name, args; /* still-escaped slices, n == 0 when absent */
+};
+
+struct delta_hit {
+    struct str content, reasoning, reasoning_alt;
+    int content_key;       /* "content" appeared (jobj_get stops at the first) */
+    int content_ok;        /* ... and it was a string */
+    int saw_reasoning;     /* "reasoning_content" existed, any type: the DOM */
+    int saw_reasoning_alt; /* checks it first and stops there */
+    int finish_key;
+    int finish_ok;         /* finish_reason was a string (possibly empty) */
+    struct str finish;
+    struct call_delta calls[FAST_CALLS];
+    int n_calls;
+};
+
+static size_t jw(const char *s, size_t n, size_t i)
+{
+    while (i < n) {
+        char c = s[i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+            break;
+        i++;
+    }
+    return i;
+}
+
+/* A string literal at s[i] (which must be the opening quote): the slice
+ * between the quotes and the index past the closing one, or (size_t)-1.
+ * Delegates to jstr_end, so the escape rules are literally the parser's. */
+static size_t jw_str(const char *s, size_t n, size_t i, struct str *out)
+{
+    if (i >= n || s[i] != '"')
+        return (size_t)-1;
+    return jstr_end(s, n, i + 1, out);
+}
+
+/* A number literal: the same conversion jparse_number applies (integer
+ * literals through _strtoui64, anything else through strtod and a cast,
+ * anything 40 bytes or longer reading as 0). */
+static int jw_num(const char *s, size_t n, size_t i, int64_t *out,
+                  size_t *after)
+{
+    size_t start = i;
+    if (i < n && s[i] == '-')
+        i++;
+    while (i < n && s[i] >= '0' && s[i] <= '9')
+        i++;
+    int is_int = 1;
+    if (i < n && s[i] == '.') {
+        is_int = 0;
+        i++;
+        while (i < n && s[i] >= '0' && s[i] <= '9')
+            i++;
+    }
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        is_int = 0;
+        i++;
+        if (i < n && (s[i] == '+' || s[i] == '-'))
+            i++;
+        while (i < n && s[i] >= '0' && s[i] <= '9')
+            i++;
+    }
+    if (i == start)
+        return 0;
+    size_t len = i - start;
+    *out = 0;
+    if (len < 40) {
+        char tmp[40];
+        memcpy(tmp, s + start, len);
+        tmp[len] = '\0';
+        *out = is_int ? (int64_t)_strtoui64(tmp, NULL, 10)
+                      : (int64_t)strtod(tmp, NULL);
+    }
+    *after = i;
+    return 1;
+}
+
+/* Consume any value, building nothing. (size_t)-1 when the bytes are not a
+ * value at all. */
+static size_t jw_value(const char *s, size_t n, size_t i, int depth)
+{
+    if (depth > JSON_MAX_DEPTH)
+        return (size_t)-1;
+    i = jw(s, n, i);
+    if (i >= n)
+        return (size_t)-1;
+    char c = s[i];
+    if (c == '"')
+        return jw_str(s, n, i, NULL);
+    if (c != '{' && c != '[') {
+        size_t start = i;
+        while (i < n) {
+            char d = s[i];
+            if (d == ',' || d == '}' || d == ']' || d == ':' || d <= ' ')
+                break;
+            i++;
+        }
+        return i == start ? (size_t)-1 : i;
+    }
+    char close = c == '{' ? '}' : ']';
+    i = jw(s, n, i + 1);
+    if (i < n && s[i] == close)
+        return i + 1;
+    for (;;) {
+        if (c == '{') {
+            i = jw_str(s, n, i, NULL);
+            if (i == (size_t)-1)
+                return (size_t)-1;
+            i = jw(s, n, i);
+            if (i >= n || s[i] != ':')
+                return (size_t)-1;
+            i = jw(s, n, i + 1);
+        }
+        i = jw_value(s, n, i, depth + 1);
+        if (i == (size_t)-1)
+            return (size_t)-1;
+        i = jw(s, n, i);
+        if (i < n && s[i] == ',') {
+            i = jw(s, n, i + 1);
+            continue;
+        }
+        if (i < n && s[i] == close)
+            return i + 1;
+        return (size_t)-1;
+    }
+}
+
+/* One member of the object whose value position is *pi: the key and the index
+ * of its value. 0 = a member was read, 1 = the object ended, -1 = garbage.
+ * Four levels of the scan share this, so the separator bookkeeping is
+ * written once. */
+static int jw_member(const char *s, size_t n, size_t *pi, struct str *key)
+{
+    size_t i = jw(s, n, *pi);
+    if (i < n && s[i] == '}') {
+        *pi = i + 1;
+        return 1;
+    }
+    i = jw_str(s, n, i, key);
+    if (i == (size_t)-1)
+        return -1;
+    i = jw(s, n, i);
+    if (i >= n || s[i] != ':')
+        return -1;
+    *pi = jw(s, n, i + 1);
+    if (*pi >= n) /* a member with no value left in the buffer is not JSON;
+                   * guarding here keeps every caller's s[i] in bounds */
+        return -1;
+    return 0;
+}
+
+/* The separator after a member or element: , or the closing brace/bracket.
+ * 1 = more follow, 0 = container ended, -1 = garbage. */
+static int jw_after(const char *s, size_t n, size_t *pi, char close)
+{
+    size_t i = jw(s, n, *pi);
+    if (i < n && s[i] == ',') {
+        *pi = jw(s, n, i + 1);
+        return 1;
+    }
+    if (i < n && s[i] == close) {
+        *pi = i + 1;
+        return 0;
+    }
+    return -1;
+}
+
+#define JKEY(k, lit)                                                     \
+    ((k).n == sizeof(lit) - 1 && memcmp((k).p, lit, sizeof(lit) - 1) == 0)
+
+static int jw_is_null(const char *s, size_t n, size_t i)
+{
+    return i + 4 <= n && memcmp(s + i, "null", 4) == 0;
+}
+
+/* "tool_calls": [ {...}, ... ] — up to FAST_CALLS items, each read the way
+ * the DOM loop reads one: the first key wins, a non-object element is skipped,
+ * anything richer than that falls back rather than growing storage here. */
+static size_t scan_tool_calls(const char *s, size_t n, size_t i,
+                              struct delta_hit *h)
+{
+    i = jw(s, n, i);
+    if (i >= n)
+        return (size_t)-1;
+    if (s[i] != '[')
+        return jw_value(s, n, i, 1); /* no array: the DOM finds no calls */
+    i = jw(s, n, i + 1);
+    if (i < n && s[i] == ']')
+        return i + 1;
+    for (;;) {
+        size_t j = jw(s, n, i);
+        if (j >= n)
+            return (size_t)-1;
+        if (s[j] == '{') {
+            struct call_delta *d = &h->calls[h->n_calls];
+            memset(d, 0, sizeof *d);
+            j = jw(s, n, j + 1);
+            struct str key;
+            for (;;) {
+                int m = jw_member(s, n, &j, &key);
+                if (m < 0)
+                    return (size_t)-1;
+                if (m == 1)
+                    break;
+                if (JKEY(key, "index")) {
+                    if (!d->has_index) {
+                        d->has_index = 1;
+                        if (s[j] == '-' || (s[j] >= '0' && s[j] <= '9')) {
+                            if (!jw_num(s, n, j, &d->index, &j))
+                                return (size_t)-1;
+                        } else {
+                            /* any other value reads as index 0 in the DOM */
+                            j = jw_value(s, n, j, 1);
+                            if (j == (size_t)-1)
+                                return (size_t)-1;
+                        }
+                    } else {
+                        j = jw_value(s, n, j, 1);
+                        if (j == (size_t)-1)
+                            return (size_t)-1;
+                    }
+                } else if (JKEY(key, "id")) {
+                    if (!d->id_key && s[j] == '"') {
+                        d->id_key = 1;
+                        j = jw_str(s, n, j, &d->id);
+                        if (j == (size_t)-1)
+                            return (size_t)-1;
+                    } else {
+                        j = jw_value(s, n, j, 1);
+                        if (j == (size_t)-1)
+                            return (size_t)-1;
+                    }
+                } else if (JKEY(key, "function")) {
+                    size_t f = jw(s, n, j);
+                    if (f >= n || s[f] != '{') {
+                        j = jw_value(s, n, j, 1);
+                        if (j == (size_t)-1)
+                            return (size_t)-1;
+                    } else {
+                        j = jw(s, n, f + 1);
+                        struct str fk;
+                        for (;;) {
+                            int fm = jw_member(s, n, &j, &fk);
+                            if (fm < 0)
+                                return (size_t)-1;
+                            if (fm == 1)
+                                break;
+                            if (!d->name_key && JKEY(fk, "name")
+                                && s[j] == '"') {
+                                d->name_key = 1;
+                                j = jw_str(s, n, j, &d->name);
+                            } else if (!d->args_key && JKEY(fk, "arguments")
+                                       && s[j] == '"') {
+                                d->args_key = 1;
+                                j = jw_str(s, n, j, &d->args);
+                            } else {
+                                j = jw_value(s, n, j, 1);
+                            }
+                            if (j == (size_t)-1)
+                                return (size_t)-1;
+                            int fs = jw_after(s, n, &j, '}');
+                            if (fs < 0)
+                                return (size_t)-1;
+                            if (fs == 0)
+                                break;
+                        }
+                    }
+                } else {
+                    j = jw_value(s, n, j, 1);
+                    if (j == (size_t)-1)
+                        return (size_t)-1;
+                }
+                int sep = jw_after(s, n, &j, '}');
+                if (sep < 0)
+                    return (size_t)-1;
+                if (sep == 0)
+                    break;
+            }
+            i = j;
+            h->n_calls++;
+        } else {
+            /* a non-object element: the DOM skips it, so nothing is captured */
+            i = jw_value(s, n, j, 1);
+            if (i == (size_t)-1)
+                return (size_t)-1;
+        }
+        int sep = jw_after(s, n, &i, ']');
+        if (sep < 0)
+            return (size_t)-1;
+        if (sep == 0)
+            return i;
+        if (h->n_calls == FAST_CALLS)
+            return (size_t)-1; /* more calls than this scan holds: the parser
+                               * has no limit, so let it have the event */
+    }
+}
+
+static size_t scan_delta(const char *s, size_t n, size_t i,
+                         struct delta_hit *h)
+{
+    i = jw(s, n, i);
+    if (i >= n)
+        return (size_t)-1;
+    if (s[i] != '{')
+        return jw_value(s, n, i, 1);
+    i = jw(s, n, i + 1);
+    struct str key;
+    for (;;) {
+        int m = jw_member(s, n, &i, &key);
+        if (m == 1)
+            return i;
+        if (m < 0)
+            return (size_t)-1;
+        if (JKEY(key, "content")) {
+            if (!h->content_key && s[i] == '"') {
+                h->content_key = 1;
+                i = jw_str(s, n, i, &h->content);
+                if (i == (size_t)-1)
+                    return (size_t)-1;
+                h->content_ok = 1;
+            } else {
+                i = jw_value(s, n, i, 1);
+            }
+        } else if (JKEY(key, "reasoning_content")) {
+            if (!h->saw_reasoning && s[i] == '"') {
+                i = jw_str(s, n, i, &h->reasoning);
+                if (i == (size_t)-1)
+                    return (size_t)-1;
+            } else {
+                i = jw_value(s, n, i, 1);
+            }
+            h->saw_reasoning = 1; /* the DOM stops looking once the key
+                                   * exists, whatever it holds */
+        } else if (JKEY(key, "reasoning")) {
+            if (!h->saw_reasoning_alt && s[i] == '"') {
+                i = jw_str(s, n, i, &h->reasoning_alt);
+                if (i == (size_t)-1)
+                    return (size_t)-1;
+            } else {
+                i = jw_value(s, n, i, 1);
+            }
+            h->saw_reasoning_alt = 1;
+        } else if (JKEY(key, "tool_calls")) {
+            i = scan_tool_calls(s, n, i, h);
+        } else {
+            i = jw_value(s, n, i, 1);
+        }
+        if (i == (size_t)-1)
+            return (size_t)-1;
+        int sep = jw_after(s, n, &i, '}');
+        if (sep < 0)
+            return (size_t)-1;
+        if (sep == 0)
+            return i;
+    }
+}
+
+/* choices[0]: the DOM reads only the first element, so the rest is skipped
+ * rather than parsed. */
+static size_t scan_choice(const char *s, size_t n, size_t i,
+                          struct delta_hit *h)
+{
+    i = jw(s, n, i);
+    if (i >= n)
+        return (size_t)-1;
+    if (s[i] != '[')
+        return jw_value(s, n, i, 1);
+    i = jw(s, n, i + 1);
+    if (i < n && s[i] == ']')
+        return i + 1;
+    if (s[i] != '{') {
+        i = jw_value(s, n, i, 1); /* not an object: the DOM gets nothing */
+        if (i == (size_t)-1)
+            return (size_t)-1;
+    } else {
+        i = jw(s, n, i + 1);
+        struct str key;
+        for (;;) {
+            int m = jw_member(s, n, &i, &key);
+            if (m < 0)
+                return (size_t)-1;
+            if (m == 1)
+                break;
+            if (JKEY(key, "delta")) {
+                i = scan_delta(s, n, i, h);
+            } else if (JKEY(key, "finish_reason")) {
+                if (!h->finish_key && s[i] == '"') {
+                    h->finish_key = 1;
+                    i = jw_str(s, n, i, &h->finish);
+                    if (i == (size_t)-1)
+                        return (size_t)-1;
+                    h->finish_ok = 1;
+                } else {
+                    i = jw_value(s, n, i, 1);
+                }
+            } else {
+                i = jw_value(s, n, i, 1);
+            }
+            if (i == (size_t)-1)
+                return (size_t)-1;
+            int sep = jw_after(s, n, &i, '}');
+            if (sep < 0)
+                return (size_t)-1;
+            if (sep == 0)
+                break;
+        }
+    }
+    /* any further elements: the DOM ignores them, so consume and discard */
+    for (;;) {
+        int sep = jw_after(s, n, &i, ']');
+        if (sep < 0)
+            return (size_t)-1;
+        if (sep == 0)
+            return i;
+        i = jw_value(s, n, i, 1);
+        if (i == (size_t)-1)
+            return (size_t)-1;
+    }
+}
+
+static int delta_fast_scan(const char *s, size_t n, struct delta_hit *h)
+{
+    memset(h, 0, sizeof *h);
+    size_t i = jw(s, n, 0);
+    if (i >= n || s[i] != '{')
+        return 0;
+    i = jw(s, n, i + 1);
+    if (i < n && s[i] == '}')
+        return 1; /* an empty object moves no state, in either path */
+    struct str key;
+    for (;;) {
+        int m = jw_member(s, n, &i, &key);
+        if (m < 0)
+            return 0;
+        if (m == 1)
+            return 1;
+        if (JKEY(key, "choices")) {
+            i = scan_choice(s, n, i, h);
+        } else if (JKEY(key, "usage")) {
+            /* most chunks carry "usage":null; a real usage object stays with
+             * the parser, which reads four token fields out of it */
+            if (jw_is_null(s, n, i))
+                i += 4;
+            else
+                return 0;
+        } else if (JKEY(key, "error")) {
+            return 0;
+        } else {
+            i = jw_value(s, n, i, 1);
+        }
+        if (i == (size_t)-1)
+            return 0;
+        int sep = jw_after(s, n, &i, '}');
+        if (sep < 0)
+            return 0;
+        if (sep == 0)
+            return 1;
+    }
+}
+
+/* --- the three appliers both paths share --------------------------------- */
+
+static void stream_apply_text(void (*hook)(const char *, size_t),
+                              struct buf *dst, struct str raw)
+{
+    if (!raw.n)
+        return;
+    size_t at = dst->len;
+    jdecode_str(raw, dst);
+    if (hook)
+        hook(dst->p + at, dst->len - at);
+}
+
+static void stream_apply_finish(struct stream_state *st, struct str reason)
+{
+    if (str_eqc(reason, "tool_calls"))
+        st->finish = FINISH_TOOL_CALLS;
+    else if (str_eqc(reason, "length"))
+        st->finish = FINISH_LENGTH;
+    else if (st->finish == FINISH_NONE)
+        st->finish = FINISH_STOP;
+}
+
+/* Fold one tool-call delta into the assembly: slot lookup by index, the
+ * providers that leave `index` out (a fresh id opens a slot, a delta without
+ * one continues the last), the name, the argument fragments and the live
+ * byte/line counter. Exactly one implementation, fed by either reader. */
+static void stream_apply_call(struct stream_state *st,
+                              const struct call_delta *d)
+{
+    char *new_id = d->id.n ? jdecode_dupz(d->id) : NULL;
+    size_t last = st->n_calls ? st->n_calls - 1 : 0;
+    size_t idx = (size_t)d->index;
+    if (!d->has_index) {
+        if (new_id && st->n_calls > 0
+            && strcmp(st->calls[last].id ? st->calls[last].id : "", new_id)
+                != 0)
+            idx = (size_t)st->n_calls;
+        else
+            idx = last;
+    }
+    struct stream_call *call = stream_call_by_index(st, idx);
+    if (new_id) {
+        free(call->id);
+        call->id = new_id;
+    }
+    if (d->name.n) {
+        free(call->name);
+        call->name = jdecode_dupz(d->name);
+    }
+    if (d->args.n) {
+        size_t at = call->args.len;
+        jdecode_str(d->args, &call->args);
+        gen_progress(call->name, &call->args, at);
+    }
+}
+
+static void stream_apply_hit(struct stream_state *st,
+                             const struct stream_hooks *hooks,
+                             const struct delta_hit *h)
+{
+    if (h->finish_ok)
+        stream_apply_finish(st, h->finish);
+    if (h->saw_reasoning)
+        stream_apply_text(hooks->think, &st->reasoning, h->reasoning);
+    else if (h->saw_reasoning_alt)
+        stream_apply_text(hooks->think, &st->reasoning,
+                          h->reasoning_alt);
+    if (h->content_ok)
+        stream_apply_text(hooks->text, &st->content, h->content);
+    for (int k = 0; k < h->n_calls; k++)
+        stream_apply_call(st, &h->calls[k]);
+}
+
+/* Set only by the differential probe in tmp/bench.c, which runs every event
+ * through both paths and compares the assembled result. */
+static int g_delta_fast_off;
+
 /* One SSE data payload: parse and fold into state + hooks. Decoded deltas
  * go straight into their owning buffers — the hooks render from the
  * appended range, so no scratch copy per delta is needed. */
@@ -3964,6 +4532,12 @@ static void stream_handle_data(struct str data, void *user)
     if (str_eqc(data, "[DONE]")) {
         if (st->finish == FINISH_NONE)
             st->finish = FINISH_STOP;
+        return;
+    }
+
+    struct delta_hit dh;
+    if (!g_delta_fast_off && delta_fast_scan(data.p, data.n, &dh)) {
+        stream_apply_hit(st, &cr->hooks, &dh);
         return;
     }
 
@@ -4023,16 +4597,8 @@ static void stream_handle_data(struct str data, void *user)
     struct jnode *choice = choices->head;
 
     struct jnode *jfinish = jobj_get(choice, "finish_reason");
-    if (jfinish) {
-        if (jfinish->tag == J_STR) {
-            if (str_eqc(jfinish->raw, "tool_calls"))
-                st->finish = FINISH_TOOL_CALLS;
-            else if (str_eqc(jfinish->raw, "length"))
-                st->finish = FINISH_LENGTH;
-            else if (st->finish == FINISH_NONE)
-                st->finish = FINISH_STOP;
-        }
-    }
+    if (jfinish && jfinish->tag == J_STR)
+        stream_apply_finish(st, jfinish->raw);
 
     struct jnode *delta = jobj_get(choice, "delta");
     if (!delta)
@@ -4041,64 +4607,40 @@ static void stream_handle_data(struct str data, void *user)
     struct jnode *r = jobj_get(delta, "reasoning_content");
     if (!r)
         r = jobj_get(delta, "reasoning");
-    if (r && r->tag == J_STR && r->raw.n > 0) {
-        size_t at = st->reasoning.len;
-        jdecode_str(r->raw, &st->reasoning);
-        if (cr->hooks.think)
-            cr->hooks.think(st->reasoning.p + at, st->reasoning.len - at);
-    }
+    if (r && r->tag == J_STR)
+        stream_apply_text(cr->hooks.think, &st->reasoning, r->raw);
 
     struct jnode *t = jobj_get(delta, "content");
-    if (t && t->tag == J_STR && t->raw.n > 0) {
-        size_t at = st->content.len;
-        jdecode_str(t->raw, &st->content);
-        if (cr->hooks.text)
-            cr->hooks.text(st->content.p + at, st->content.len - at);
-    }
+    if (t && t->tag == J_STR)
+        stream_apply_text(cr->hooks.text, &st->content, t->raw);
 
     struct jnode *tcalls = jobj_get(delta, "tool_calls");
     if (tcalls && tcalls->tag == J_ARR) {
         for (struct jnode *item = tcalls->head; item; item = item->next) {
             if (item->tag != J_OBJ)
                 continue;
+            /* Read the event into the same shape the fast scan produces; the
+             * assembly itself lives in stream_apply_call only. */
+            struct call_delta d;
+            memset(&d, 0, sizeof d);
             struct jnode *jidx = jobj_get(item, "index");
+            if (jidx) {
+                d.has_index = 1;
+                d.index = jnum_i(jidx);
+            }
             struct jnode *jid = jobj_get(item, "id");
-            char *new_id = (jid && jid->tag == J_STR && jid->raw.n > 0)
-                               ? jstr_dupz(jid)
-                               : NULL;
-            int64_t idx = jnum_i(jidx);
-            if (!jidx) {
-                /* Providers that leave `index` out of the deltas would
-                 * otherwise fold every call into slot 0 and concatenate
-                 * their arguments into unparseable JSON: a fresh id opens
-                 * a slot, a delta without one continues the last. */
-                size_t last = st->n_calls ? st->n_calls - 1 : 0;
-                if (new_id && st->n_calls > 0
-                    && strcmp(st->calls[last].id ? st->calls[last].id : "",
-                              new_id) != 0)
-                    idx = (int64_t)st->n_calls;
-                else
-                    idx = (int64_t)last;
-            }
-            struct stream_call *call = stream_call_by_index(st, (size_t)idx);
-            if (new_id) {
-                free(call->id);
-                call->id = new_id;
-            }
+            if (jid && jid->tag == J_STR && jid->raw.n > 0)
+                d.id = jid->raw;
             struct jnode *fn = jobj_get(item, "function");
             if (fn && fn->tag == J_OBJ) {
                 struct jnode *name = jobj_get(fn, "name");
-                if (name && name->tag == J_STR && name->raw.n > 0) {
-                    free(call->name);
-                    call->name = jstr_dupz(name);
-                }
+                if (name && name->tag == J_STR && name->raw.n > 0)
+                    d.name = name->raw;
                 struct jnode *args = jobj_get(fn, "arguments");
-                if (args && args->tag == J_STR && args->raw.n > 0) {
-                    size_t at = call->args.len;
-                    jdecode_str(args->raw, &call->args);
-                    gen_progress(call->name, &call->args, at);
-                }
+                if (args && args->tag == J_STR && args->raw.n > 0)
+                    d.args = args->raw;
             }
+            stream_apply_call(st, &d);
         }
     }
 }
