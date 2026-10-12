@@ -11,7 +11,7 @@
  *   4. terminal      console VT setup, output lock, WinHTTP transport
  *   5. markdown      single-pass streaming renderer (append-only painter)
  *   6. protocol      SSE framing + OpenAI chat-completions delta assembly
- *   7. tools         read / write / edit / bash
+ *   7. tools         read / write / bash / find / grep
  *   8. session       JSONL persistence, config kv store, system prompt
  *   9. ui            line editor, slash commands, AGENTS.md
  *  10. agent         turn loop + wmain
@@ -21,8 +21,8 @@
  * slices into a buffer the caller keeps alive. strdup only for data that
  * outlives the turn (conversation history, session records).
  *
- * Design reference: PLAN.md. Display == model view: nothing the model sees
- * is hidden from the screen and vice versa.
+ * Display == model view: nothing the model sees is hidden from the screen and
+ * vice versa. The rules the code follows are in help.md.
  */
 
 /* Trim windows.h: kk only uses console/process/thread/WinHTTP APIs —
@@ -2077,6 +2077,8 @@ static int http_post_stream(const char *url, const char *auth_key,
         *body_out = xstrdup("WinHttpOpen failed");
         goto out;
     }
+    /* the host's wide form is a UTF-8 probe and nothing more: WinHttpConnect
+     * widens the host itself, against the connection handle it caches */
     whost = w_from_utf8(host);
     wpath = w_from_utf8(path);
     if (!whost || !wpath) {
@@ -2100,6 +2102,7 @@ static int http_post_stream(const char *url, const char *auth_key,
     }
 
     DWORD wire_len = (DWORD)body_len;
+    DWORD t_send = GetTickCount();
     for (int attempt = 0;; attempt++) {
         HINTERNET connect = http_connect(host, port, https);
         if (!connect) {
@@ -2125,11 +2128,16 @@ static int http_post_stream(const char *url, const char *auth_key,
         if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                 (LPVOID)body, wire_len, wire_len, 0)) {
             /* a pooled keep-alive connection the server already closed
-             * fails right here; drop it and rebuild exactly once */
+             * fails right here; drop it and rebuild exactly once — but only
+             * when the first attempt failed FAST. A refused connect costs
+             * the OS ~2s and a blackholed one the full connect timeout, and
+             * a second identical try then just doubles the wait before the
+             * same error: slow failures are the network's answer, not a
+             * stale socket's. */
             WinHttpCloseHandle(request);
             request = NULL;
             http_disconnect();
-            if (attempt == 0)
+            if (attempt == 0 && GetTickCount() - t_send < 5000)
                 continue;
             *body_out = xasprintf("send failed (WinHttp error %lu)",
                                   GetLastError());
@@ -5622,16 +5630,15 @@ static char *tool_find(const struct jnode *args, struct tool_img *img_)
     (void)img_; /* only read attaches images */
     char *query = jstr_dupz(jobj_get(args, "query"));
     char *glob = jstr_dupz(jobj_get(args, "glob"));
+    char *result = NULL;
     if (glob && !*glob) {
-        free(query);
-        free(glob);
-        return xstrdup("error: find glob is empty; omit glob to search by "
-                       "name, or pass no arguments to list the workspace");
+        result = xstrdup("error: find glob is empty; omit glob to search by "
+                         "name, or pass no arguments to list the workspace");
+        goto cleanup;
     }
     if (!fff_ensure()) {
-        free(query);
-        free(glob);
-        return xstrdup("error: 文件索引不可用（fff DLL 未随 kk.exe 提供）");
+        result = xstrdup("error: 文件索引不可用（fff DLL 未随 kk.exe 提供）");
+        goto cleanup;
     }
     int64_t off = args_int(args, "offset", 0);
     if (off < 0)
@@ -5647,16 +5654,13 @@ static char *tool_find(const struct jnode *args, struct tool_img *img_)
                      20, 0, 0);
     }
     if (!r) {
-        free(query);
-        free(glob);
-        return xstrdup("error: find failed");
+        result = xstrdup("error: find failed");
+        goto cleanup;
     }
     if (!r->success) {
-        char *msg = xasprintf("error: %s", r->error ? r->error : "find failed");
+        result = xasprintf("error: %s", r->error ? r->error : "find failed");
         fff.free_result(r);
-        free(query);
-        free(glob);
-        return msg;
+        goto cleanup;
     }
     struct FffSearchResult *sr = r->handle;
     if (fff.track && sr->count > 0 && tracked && *tracked)
@@ -5691,6 +5695,11 @@ static char *tool_find(const struct jnode *args, struct tool_img *img_)
     fff.free_search(sr);
     fff.free_result(r);
     return buf_detach(&out);
+
+cleanup:
+    free(query);
+    free(glob);
+    return result;
 }
 
 /* One grep context line: dim two-space indent, capped content. */
@@ -5704,13 +5713,14 @@ static char *tool_grep(const struct jnode *args, struct tool_img *img_)
 {
     (void)img_; /* only read attaches images */
     char *query = jstr_dupz(jobj_get(args, "query"));
+    char *result = NULL;
     if (!query || !*query) {
-        free(query);
-        return xstrdup("error: grep requires a query");
+        result = xstrdup("error: grep requires a query");
+        goto cleanup;
     }
     if (!fff_ensure()) {
-        free(query);
-        return xstrdup("error: 文件索引不可用（fff DLL 未随 kk.exe 提供）");
+        result = xstrdup("error: 文件索引不可用（fff DLL 未随 kk.exe 提供）");
+        goto cleanup;
     }
     struct jnode *rx = jobj_get(args, "regex");
     int mode = rx && rx->tag == J_TRUE ? 1 : 0; /* 0 plain SIMD, 1 regex */
@@ -5773,6 +5783,10 @@ static char *tool_grep(const struct jnode *args, struct tool_img *img_)
     fff.free_grep(gr);
     fff.free_result(r);
     return buf_detach(&out);
+
+cleanup:
+    free(query);
+    return result;
 }
 
 /* --- read ---------------------------------------------------------------- */
@@ -10328,6 +10342,17 @@ static int64_t parse_context_limit(const char *err)
     return best;
 }
 
+/* Index of the last message carrying this role, or cv->msgs.n when there is
+ * none. Recycling, stubbing and compaction each ask this walking back from
+ * the tail, so the walk exists once. */
+static size_t conv_rfind(const struct conversation *cv, const char *role)
+{
+    for (size_t i = cv->msgs.n; i > 0; i--)
+        if (strcmp(cv->msgs.p[i - 1].role, role) == 0)
+            return i - 1;
+    return cv->msgs.n;
+}
+
 /* Overflow recovery when the whole history IS the current turn (no head
  * to fold): replace earlier tool outputs with visible stubs, keeping
  * only the most recent one verbatim — tool output is the only thing
@@ -10338,16 +10363,11 @@ static int64_t parse_context_limit(const char *err)
  * it removed from what the next request will carry. */
 static int conv_stub_tool_results(struct conversation *cv, size_t *freed)
 {
-    size_t last = cv->msgs.n;
-    for (size_t i = cv->msgs.n; i > 0; i--)
-        if (strcmp(cv->msgs.p[i - 1].role, "tool") == 0) {
-            last = i - 1;
-            break;
-        }
+    size_t last = conv_rfind(cv, "tool");
     if (last == cv->msgs.n)
         return 0; /* no tool output at all */
     int n_tools = 0;
-    for (size_t i = 0; i <= last && i < cv->msgs.n; i++)
+    for (size_t i = 0; i <= last; i++)
         if (strcmp(cv->msgs.p[i].role, "tool") == 0)
             n_tools++;
     if (!n_tools)
@@ -10355,7 +10375,7 @@ static int conv_stub_tool_results(struct conversation *cv, size_t *freed)
 
     int n = 0;
     size_t bytes = 0;
-    for (size_t i = 0; i <= last && i < cv->msgs.n; i++) {
+    for (size_t i = 0; i <= last; i++) {
         struct message *m = &cv->msgs.p[i];
         if (strcmp(m->role, "tool") != 0 || !m->content)
             continue;
@@ -10445,13 +10465,8 @@ static int conv_compact(struct config *cfg, struct conversation *cv,
      * exchange (and its tool traffic) verbatim and is always a safe
      * request boundary — a tail can never begin with an orphan tool
      * result */
-    size_t cut = 0;
-    for (size_t i = cv->msgs.n; i > 0; i--)
-        if (strcmp(cv->msgs.p[i - 1].role, "user") == 0) {
-            cut = i - 1;
-            break;
-        }
-    if (cut == 0) {
+    size_t cut = conv_rfind(cv, "user");
+    if (cut == 0 || cut == cv->msgs.n) {
         out_puts("会话还很短，无需压缩\r\n");
         return 0;
     }
@@ -10688,6 +10703,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
          * transport/HTTP failures, but never replay a partial stream */
         int attempt = 0;
         int status;
+        DWORD t_round = GetTickCount();
         for (;;) {
             DWORD t_req = GetTickCount();
             status = chat_stream(cfg, cv, system_prompt, 1, &hooks, &st);
@@ -10703,6 +10719,14 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 || g_stream_bytes)
                 break; /* a partial stream must not be replayed */
             if (++attempt >= 3)
+                break;
+            /* and a wall-clock budget beside the attempt count: one refused
+             * connect costs the OS ~2s, a blackholed one the whole connect
+             * timeout, so three blind retries held a dead endpoint for a
+             * minute before saying so. Fast failures still get all three
+             * tries; once the round has burned its budget the error is the
+             * honest answer. */
+            if (GetTickCount() - t_round > 8000)
                 break;
             if (g_emit_vt)
                 out_printf("\r\x1b[0K\x1b[2m⚠ 连接异常，正在重试（%d/2）…\x1b[0m\r\n",
