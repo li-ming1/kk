@@ -6309,14 +6309,19 @@ static char *tool_write(const struct jnode *args, struct tool_img *img_)
                          "bash (Get-Content + Select-Object -Index)");
         goto cleanup;
     }
-    if (file_locked(path)) {
-        result = xstrdup("error: file is locked by another process");
-        goto cleanup;
-    }
+    /* One exclusive open answers both questions, as in tool_read: the probe
+     * and the read used to be two CreateFileW calls, and a write of an
+     * existing file is the common case the tool description pushes the model
+     * toward. Message text is unchanged: a sharing violation is the lock, any
+     * other failure is the unreadable file, and a missing file is neither. */
     size_t len = 0;
-    data = file_read_all(path, &len);
+    int locked = 0;
+    data = file_read_excl(path, &len, &locked);
     if (!data) {
-        result = xasprintf("error: cannot read '%.*s'", (int)path.n, path.p);
+        result = locked
+                     ? xstrdup("error: file is locked by another process")
+                     : xasprintf("error: cannot read '%.*s'", (int)path.n,
+                                 path.p);
         goto cleanup;
     }
     /* invalid UTF-8 on disk (GBK etc.): transcode in memory so old_string
