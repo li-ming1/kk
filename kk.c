@@ -504,50 +504,103 @@ static int jhex(char c)
     return -1;
 }
 
+/* s[i] is the backslash of an escape: validate it and return the index just
+ * past the sequence, or (size_t)-1 on malformed input. One rule for every
+ * scanner, so what the parser accepts and what the fast scan accepts match. */
+static size_t jstr_escape(const char *s, size_t n, size_t i)
+{
+    if (++i >= n)
+        return (size_t)-1;
+    char e = s[i];
+    if (e == 'u') {
+        for (int k = 1; k <= 4; k++)
+            if (i + (size_t)k >= n || jhex(s[i + (size_t)k]) < 0)
+                return (size_t)-1;
+        return i + 5;
+    }
+    if (e == '"' || e == '\\' || e == '/' || e == 'b' || e == 'f' || e == 'n'
+        || e == 'r' || e == 't')
+        return i + 1;
+    return (size_t)-1;
+}
+
+/* The end of a JSON string whose content starts at s[i]: the slice between the
+ * quotes (when out is given) and the index past the closing quote, or
+ * (size_t)-1.
+ *
+ * Why it is windowed. Measured on this machine (tmp/probe4.c): the
+ * byte-at-a-time walk costs ~2 ns/byte and memchr (AVX2 in the CRT) ~0.1, so
+ * the loop only wins below ~24 bytes — keys (8-16 B) favor it by up to 1.26x,
+ * while anything 128 B and up favors memchr by 10-35x. Model content and tool
+ * arguments are in that second group, which is what this path spends its time
+ * on. A plain "find the quote, then look for a backslash before it" re-scans
+ * from the quote on every escape, which is quadratic in the escape count (same
+ * probe: 8x slower than the byte loop at 8 KB), so both scans here are bounded
+ * to one window: two vector passes per window, wherever the escapes are. */
+#define JSTR_WINDOW 1024
+static size_t jstr_end(const char *s, size_t n, size_t i, struct str *out)
+{
+    size_t start = i;
+    for (;;) {
+        if (i >= n)
+            return (size_t)-1;
+        size_t rest = n - i;
+        if (rest <= 24) { /* the tail: two vector calls cannot pay for
+                            * themselves under the measured crossover */
+            while (i < n) {
+                unsigned char c = (unsigned char)s[i];
+                if (c == '"') {
+                    if (out) {
+                        out->p = s + start;
+                        out->n = i - start;
+                    }
+                    return i + 1;
+                }
+                if (c == '\\') {
+                    i = jstr_escape(s, n, i);
+                    if (i == (size_t)-1)
+                        return (size_t)-1;
+                    continue;
+                }
+                i++;
+            }
+            return (size_t)-1;
+        }
+        size_t win = rest > JSTR_WINDOW ? JSTR_WINDOW : rest;
+        const char *q = (const char *)memchr(s + i, '"', win);
+        const char *b = (const char *)memchr(s + i, '\\',
+                                            q ? (size_t)(q - (s + i)) : win);
+        if (b) { /* an escape comes first, or there is no quote before it */
+            i = jstr_escape(s, n, (size_t)(b - s));
+            if (i == (size_t)-1)
+                return (size_t)-1;
+            continue;
+        }
+        if (q) {
+            if (out) {
+                out->p = s + start;
+                out->n = (size_t)(q - s) - start;
+            }
+            return (size_t)(q - s) + 1;
+        }
+        i += win; /* nothing interesting in this window */
+    }
+}
+
 /* Parse a string literal starting at the opening quote. Returns the raw
  * escaped slice (between the quotes) and advances past the closing quote,
- * or -1 on error. The byte-at-a-time walk measured faster than memchr
- * scans here: delta events carry mostly short keys, whose memchr call
- * overhead outweighs the scan itself. */
+ * or -1 on error. */
 static int jparse_string_raw(struct json_parser *p, struct str *out)
 {
     if (p->i >= p->n || p->s[p->i] != '"')
         return -1;
-    p->i++;
-    size_t start = p->i;
-    while (p->i < p->n) {
-        unsigned char c = (unsigned char)p->s[p->i];
-        if (c == '"') {
-            out->p = p->s + start;
-            out->n = p->i - start;
-            p->i++;
-            return 0;
-        }
-        if (c == '\\') {
-            p->i++;
-            if (p->i >= p->n)
-                return -1;
-            char e = p->s[p->i];
-            if (e == 'u') {
-                for (int k = 1; k <= 4; k++) {
-                    if (p->i + (size_t)k >= p->n || jhex(p->s[p->i + (size_t)k]) < 0)
-                        return -1;
-                }
-                p->i += 5;
-            } else if (e == '"' || e == '\\' || e == '/' || e == 'b' || e == 'f'
-                       || e == 'n' || e == 'r' || e == 't') {
-                p->i++;
-            } else {
-                return -1;
-            }
-        } else {
-            p->i++;
-        }
-    }
-    return -1;
+    size_t after = jstr_end(p->s, p->n, p->i + 1, out);
+    if (after == (size_t)-1)
+        return -1;
+    p->i = after;
+    return 0;
 }
 
-/* Value of the 4 hex digits at s[*i], advancing *i; -1 on bad input. */
 static int jhex_quad(const char *s, size_t n, size_t *i)
 {
     if (*i + 4 > n)
@@ -6131,7 +6184,7 @@ static int shell_run(struct str command,
          * one that sits silent. */
         size_t at = 0, scan_from = 0;
         size_t plen = strlen("<<<KK-DONE:") + strlen(g_ps_guid) + 1;
-        int have_marker = 0, dead = 0, cancelled = 0;
+        int have_marker = 0, dead = 0, cancelled = 0, polls = 0;
         DWORD t0 = GetTickCount();
         for (;;) {
             if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
@@ -6169,8 +6222,14 @@ static int shell_run(struct str command,
                 continue;
             }
             /* the status line (spinner thread) shows the tool label and
-             * elapsed time; the poll loop here only watches the pipe */
-            kk_nap(2, NULL);
+             * elapsed time; the poll loop here only watches the pipe.
+             * Back off after ~100 ms: a command that produces nothing for a
+             * second costs ~7x the CPU at a flat 2 ms cadence that it does no
+             * good in (measured 66M against 10M cycles for one quiet second).
+             * Forty 2 ms polls cover the calls that answer quickly; anything
+             * still silent after that is polled at 10 ms. */
+            kk_nap(polls < 40 ? 2 : 10, NULL);
+            polls++;
         }
 
         if (have_marker) {
