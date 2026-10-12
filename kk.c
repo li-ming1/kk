@@ -206,6 +206,11 @@ static void buf_append_spaces(struct buf *b, size_t n)
     }
 }
 
+/* Append a string literal without a runtime strlen: the "" concatenation
+ * forces lit to be a literal, so sizeof carries its length. Row commits and
+ * per-line emitters pay this per row. */
+#define buf_append_lit(b, lit) buf_append_n((b), "" lit, sizeof(lit) - 1)
+
 /* Format into b's spare capacity in ONE pass, appending. The previous shape
  * of every printf-style call asked vsnprintf for the length with a NULL sink
  * and then formatted again to write it — two full formatting passes, and the
@@ -923,8 +928,7 @@ static char *jstr_dupz(const struct jnode *node)
 /* Decoded string, or a copy of fallback when the node is missing. */
 static char *jstr_or(const struct jnode *node, const char *fallback)
 {
-    char *s = jstr_dupz(node);
-    return s ? s : xstrdup(fallback);
+    return xstr_or(jstr_dupz(node), fallback);
 }
 
 /* --- serialization helpers -------------------------------------------- */
@@ -2046,11 +2050,13 @@ static int http_split_url(const char *url, int *https, char **host, int *port,
 
 /* Streaming POST. Returns the HTTP status (200 = streamed via cb), 0 on a
  * transport error, or -1 when cancelled. On any non-200 the response body is
- * returned through *body_out (heap; caller frees) for error reporting. */
+ * returned through *body_out (heap; caller frees) for error reporting.
+ * body_len is passed in: the request is already a sized buffer, and a
+ * strlen over a multi-hundred-KB body every round was pure re-scan. */
 static int http_post_stream(const char *url, const char *auth_key,
-                            const char *body, long connect_timeout_ms,
-                            long idle_timeout_ms, http_stream_cb cb, void *user,
-                            char **body_out)
+                            const char *body, size_t body_len,
+                            long connect_timeout_ms, long idle_timeout_ms,
+                            http_stream_cb cb, void *user, char **body_out)
 {
     *body_out = NULL;
     int https, port;
@@ -2093,7 +2099,7 @@ static int http_post_stream(const char *url, const char *auth_key,
         }
     }
 
-    DWORD body_len = (DWORD)strlen(body);
+    DWORD wire_len = (DWORD)body_len;
     for (int attempt = 0;; attempt++) {
         HINTERNET connect = http_connect(host, port, https);
         if (!connect) {
@@ -2117,7 +2123,7 @@ static int http_post_stream(const char *url, const char *auth_key,
             goto out;
         }
         if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                (LPVOID)body, body_len, body_len, 0)) {
+                                (LPVOID)body, wire_len, wire_len, 0)) {
             /* a pooled keep-alive connection the server already closed
              * fails right here; drop it and rebuild exactly once */
             WinHttpCloseHandle(request);
@@ -2304,6 +2310,9 @@ struct painter {
 
 static void painter_set_prefix(struct painter *p, const char *prefix)
 {
+    if (p->prefix == prefix)
+        return; /* same literal as last time (code rows re-set it per line):
+                 * its metrics are already measured */
     p->prefix = prefix;
     p->prefix_bytes = prefix ? strlen(prefix) : 0;
     /* prefixes change rarely; rows start constantly — measure once here
@@ -2447,13 +2456,13 @@ static void painter_screen(struct painter *p)
 static void painter_commit_row(struct painter *p)
 {
     if (!g_emit_vt) {
-        buf_appends(&p->pending, "\r\n");
+        buf_append_lit(&p->pending, "\r\n");
         out_write(p->pending.p, p->pending.len);
         painter_close_row(p);
         return;
     }
-    buf_appends(&p->pending, "\x1b[0m\r\n"); /* close any open style: no
-                                              * bleed into the next row */
+    buf_append_lit(&p->pending, "\x1b[0m\r\n"); /* close any open style: no
+                                                 * bleed into the next row */
     painter_screen(p);
     painter_close_row(p);
 }
@@ -2895,11 +2904,18 @@ static void rd_emit_hr(struct renderer *r)
     struct painter *p = r->cur;
     painter_close_row(p);
     if (g_emit_vt)
-        buf_appends(&p->pending, "\x1b[2m");
-    for (int i = 0; i < p->usable && i < 40; i++)
-        buf_appends(&p->pending, "─");
+        buf_append_lit(&p->pending, "\x1b[2m");
+    int cols = p->usable < 40 ? p->usable : 40;
+    if (cols > 0) {
+        /* "─" is one 3-byte glyph: cols columns are a prefix of its 40-fold
+         * repetition, so the whole rule is ONE append — the old loop paid a
+         * strlen per glyph */
+        static const char hr[] =
+            "────────────────────────────────────────────────";
+        buf_append_n(&p->pending, hr, (size_t)cols * 3);
+    }
     if (g_emit_vt)
-        buf_appends(&p->pending, "\x1b[0m");
+        buf_append_lit(&p->pending, "\x1b[0m");
     painter_commit_row(p);
 }
 
@@ -3854,8 +3870,11 @@ static void hook_text(const char *s, size_t n)
 typedef void (*sse_data_cb)(struct str data, void *user);
 
 struct sse_parser {
-    struct buf line;  /* current line being assembled */
-    struct buf data;  /* data: lines of the current event, \n-joined */
+    struct buf line;   /* partial line carried across transport chunks */
+    struct buf data;   /* data: lines of the current event, \n-joined */
+    struct str direct; /* first data line of the event, while it still points
+                        * into the transport chunk: zero-copy until a second
+                        * data line joins it or the chunk ends */
     int have_data;
 };
 
@@ -3867,14 +3886,48 @@ static void sse_parser_free(struct sse_parser *sp)
 
 static void sse_dispatch(struct sse_parser *sp, sse_data_cb cb, void *user)
 {
-    if (sp->have_data && sp->data.len > 0)
-        cb((struct str){ sp->data.p, sp->data.len }, user);
+    if (sp->have_data) {
+        struct str d = sp->direct.n ? sp->direct
+                                    : (struct str){ sp->data.p, sp->data.len };
+        if (d.n)
+            cb(d, user);
+    }
     sp->data.len = 0;
+    sp->direct.n = 0;
     sp->have_data = 0;
 }
 
+/* Fold one data payload into the event under assembly. A payload that lives
+ * in the transport chunk (from_carry == 0) rides as a slice; joining a second
+ * line — or the chunk ending — materializes it into sp->data. */
+static void sse_data_add(struct sse_parser *sp, const char *d, size_t dn,
+                         int from_carry)
+{
+    if (!sp->have_data) {
+        sp->have_data = 1;
+        if (!from_carry) {
+            sp->direct.p = d;
+            sp->direct.n = dn;
+        } else {
+            buf_append_n(&sp->data, d, dn);
+        }
+        return;
+    }
+    if (sp->direct.n) {
+        buf_append_n(&sp->data, sp->direct.p, sp->direct.n);
+        sp->direct.n = 0;
+    }
+    if (sp->data.len > 0)
+        buf_appendc(&sp->data, '\n');
+    buf_append_n(&sp->data, d, dn);
+}
+
 /* Feed raw transport bytes; complete events arrive through cb. Lines are
- * gathered with memchr in one pass — no per-byte buffer appends. */
+ * gathered with memchr in one pass — no per-byte buffer appends. A line whole
+ * inside the chunk is parsed where it lies; only a line split across two
+ * chunks is copied into sp->line, and only a multi-line event accumulates in
+ * sp->data. The common OpenAI event (one data line, blank line, same chunk)
+ * costs zero copies between the socket and the delta scanner. */
 static void sse_feed(struct sse_parser *sp, const char *bytes, size_t n,
                      sse_data_cb cb, void *user)
 {
@@ -3882,13 +3935,25 @@ static void sse_feed(struct sse_parser *sp, const char *bytes, size_t n,
     while (i < n) {
         const char *nl = memchr(bytes + i, '\n', n - i);
         size_t take = nl ? (size_t)(nl - (bytes + i)) : n - i;
-        buf_append_n(&sp->line, bytes + i, take);
-        i += take;
-        if (!nl)
+        if (!nl) {
+            /* no line end in the rest of the chunk: carry the tail */
+            buf_append_n(&sp->line, bytes + i, take);
             break;
-        i++; /* consume the newline */
-        /* complete line in sp->line */
-        struct str line = { sp->line.p, sp->line.len };
+        }
+        struct str line;
+        int from_carry;
+        if (sp->line.len) {
+            /* a line split across chunks: finish it in the carry buffer */
+            buf_append_n(&sp->line, bytes + i, take);
+            line.p = sp->line.p;
+            line.n = sp->line.len;
+            from_carry = 1;
+        } else {
+            line.p = bytes + i; /* whole line here: parse it in place */
+            line.n = take;
+            from_carry = 0;
+        }
+        i += take + 1; /* consume the newline */
         if (line.n > 0 && line.p[line.n - 1] == '\r')
             line.n--;
         if (line.n == 0) {
@@ -3900,14 +3965,16 @@ static void sse_feed(struct sse_parser *sp, const char *bytes, size_t n,
                 d++;
                 dn--;
             }
-            if (sp->have_data && sp->data.len > 0)
-                buf_appendc(&sp->data, '\n');
-            buf_append_n(&sp->data, d, dn);
-            sp->have_data = 1;
+            sse_data_add(sp, d, dn, from_carry);
         }
         /* event:, id:, retry:, comments: ignored — OpenAI deltas carry all
          * state in data lines */
         sp->line.len = 0;
+    }
+    /* a payload still pointing into this chunk cannot outlive the call */
+    if (sp->direct.n) {
+        buf_append_n(&sp->data, sp->direct.p, sp->direct.n);
+        sp->direct.n = 0;
     }
 }
 
@@ -6096,7 +6163,8 @@ static size_t read_line_prefix(char *dst, size_t line_no)
  * reading and transcoding the file took. The one deliberate difference from
  * the old two-open order: a file held exclusively now reports "locked" instead
  * of "cannot read", which is the truer message. */
-static char *file_read_excl(struct str path, size_t *out_len, int *locked)
+static char *file_read_excl(struct str path, size_t *out_len, int *locked,
+                            unsigned long long *too_big_at)
 {
     wchar_t *w = path_to_w(path);
     HANDLE f = CreateFileW(w, GENERIC_READ, 0, NULL, OPEN_EXISTING,
@@ -6110,9 +6178,14 @@ static char *file_read_excl(struct str path, size_t *out_len, int *locked)
     }
     LARGE_INTEGER sz;
     /* the same ceiling file_read_all enforced, held here rather than left to
-     * the attribute probe above: a file that grows between the two would
-     * otherwise be malloc'd whole */
-    if (!GetFileSizeEx(f, &sz) || sz.QuadPart > FILE_READ_CAP) {
+     * a separate attribute probe: a file that grows between the two would
+     * otherwise be malloc'd whole — and the probe cost a syscall per read */
+    int sized = GetFileSizeEx(f, &sz) != 0;
+    if (!sized || sz.QuadPart > FILE_READ_CAP) {
+        if (too_big_at)
+            *too_big_at = sized && sz.QuadPart > FILE_READ_CAP
+                              ? (unsigned long long)sz.QuadPart
+                              : 0;
         CloseHandle(f);
         return NULL;
     }
@@ -6148,36 +6221,27 @@ static char *tool_read(const struct jnode *args, struct tool_img *img)
                        * non-positive limit means the default, never
                        * "everything" */
 
-    /* refuse sizes file_read_all would refuse, but with an honest
-     * message: a silent "cannot read" on a file that plainly exists
-     * sends the model chasing ghosts */
-    {
-        wchar_t *w = path_to_w(path);
-        WIN32_FILE_ATTRIBUTE_DATA fa;
-        if (w && GetFileAttributesExW(w, GetFileExInfoStandard, &fa)) {
-            unsigned long long sz =
-                ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-            if (sz > FILE_READ_CAP) {
-                result = xasprintf("error: '%.*s' is %llu MB — too large to "
-                                   "read whole; slice it with bash "
-                                   "(Get-Content -TotalCount / "
-                                   "Select-Object -Skip)",
-                                   (int)path.n, path.p, sz / (1024 * 1024));
-                free(w);
-                goto cleanup;
-            }
-        }
-        free(w);
-    }
-
+    /* refuse sizes file_read_excl refuses, but with an honest message: a
+     * silent "cannot read" on a file that plainly exists sends the model
+     * chasing ghosts. The size comes back from the read itself — no extra
+     * attribute syscall. */
     size_t len = 0;
     int locked = 0;
-    data = file_read_excl(path, &len, &locked);
+    unsigned long long too_big = 0;
+    data = file_read_excl(path, &len, &locked, &too_big);
     if (!data) {
-        result = locked
-                     ? xstrdup("error: file is locked by another process")
-                     : xasprintf("error: cannot read '%.*s'", (int)path.n,
-                                 path.p);
+        if (too_big)
+            result = xasprintf("error: '%.*s' is %llu MB — too large to "
+                               "read whole; slice it with bash "
+                               "(Get-Content -TotalCount / "
+                               "Select-Object -Skip)",
+                               (int)path.n, path.p,
+                               too_big / (1024 * 1024));
+        else if (locked)
+            result = xstrdup("error: file is locked by another process");
+        else
+            result = xasprintf("error: cannot read '%.*s'", (int)path.n,
+                               path.p);
         goto cleanup;
     }
     /* image attachment: detected by extension AND magic bytes, shipped
@@ -6316,7 +6380,7 @@ static char *tool_write(const struct jnode *args, struct tool_img *img_)
      * other failure is the unreadable file, and a missing file is neither. */
     size_t len = 0;
     int locked = 0;
-    data = file_read_excl(path, &len, &locked);
+    data = file_read_excl(path, &len, &locked, NULL);
     if (!data) {
         result = locked
                      ? xstrdup("error: file is locked by another process")
@@ -6404,11 +6468,11 @@ static char *b64_encode(const char *data, size_t n)
     /* 12-bit lookup: two output characters per entry, so a full 3-byte
      * group is two lookups + one 32-bit store. Image attach pushes
      * tens of MB through here (a 4K screenshot encodes to ~33MB). */
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     static uint32_t lut[4096];
     static int lut_ready;
     if (!lut_ready) {
-        static const char tbl[] =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         for (int v = 0; v < 4096; v++)
             lut[v] = (uint32_t)(unsigned char)tbl[(v >> 6) & 63]
                 | ((uint32_t)(unsigned char)tbl[v & 63] << 8);
@@ -6426,8 +6490,6 @@ static char *b64_encode(const char *data, size_t n)
         o += 4;
     }
     if (i < n) {
-        static const char tbl[] =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         uint32_t v = (uint32_t)(unsigned char)data[i] << 16;
         if (i + 1 < n)
             v |= (uint32_t)(unsigned char)data[i + 1] << 8;
@@ -6460,11 +6522,9 @@ static char g_ps_guid[16];  /* marker id of the call in flight */
 static unsigned g_ps_seq;
 static SRWLOCK g_ps_lock = SRWLOCK_INIT;
 
-static int ps_find_marker(struct buf *b, size_t from, size_t *at)
+static int ps_find_marker(struct buf *b, size_t from, const char *pre,
+                          size_t plen, size_t *at)
 {
-    char pre[48];
-    snprintf(pre, sizeof pre, "<<<KK-DONE:%s:", g_ps_guid);
-    size_t plen = strlen(pre);
     if (!b->p || b->len < plen)
         return 0;
     if (from + plen > b->len)
@@ -6819,7 +6879,11 @@ static int shell_run(struct str command,
          * forever (ping -t, a dev server) must also time out, not just
          * one that sits silent. */
         size_t at = 0, scan_from = 0;
-        size_t plen = strlen("<<<KK-DONE:") + strlen(g_ps_guid) + 1;
+        /* the marker prefix is stable for this call: build it once, not per
+         * pipe chunk */
+        char pre[48];
+        size_t plen = (size_t)snprintf(pre, sizeof pre, "<<<KK-DONE:%s:",
+                                       g_ps_guid);
         int have_marker = 0, dead = 0, cancelled = 0, polls = 0;
         DWORD t0 = GetTickCount();
         for (;;) {
@@ -6850,7 +6914,7 @@ static int shell_run(struct str command,
                     dead = 1; /* refuse unbounded output */
                     break;
                 }
-                if (ps_find_marker(&out, scan_from, &at)) {
+                if (ps_find_marker(&out, scan_from, pre, plen, &at)) {
                     have_marker = 1;
                     break;
                 }
@@ -6870,8 +6934,7 @@ static int shell_run(struct str command,
 
         if (have_marker) {
             /* completed: the session stays up for the next call */
-            *exit_code = atoi(out.p + strlen("<<<KK-DONE:")
-                              + strlen(g_ps_guid) + 1 + at);
+            *exit_code = atoi(out.p + at + plen + 1);
             /* stderr (CLIXML) often trails the marker line in the merged
              * pipe; wait briefly for it — but only when stderr actually
              * sent something, so clean calls pay nothing */
@@ -6902,14 +6965,20 @@ static int shell_run(struct str command,
                     kk_nap(2, NULL);
                 }
             }
-            /* drop the marker line itself from the middle of the stream */
+            /* drop the marker line itself from the middle of the stream —
+             * in place, then hand the buffer to the caller: a command that
+             * returned megabytes pays no second copy of them */
             char *lend = strchr(out.p + at, '\n');
             size_t llen = lend ? (size_t)(lend - (out.p + at)) + 1
                                : out.len - at;
-            buf_reset(output);
-            buf_append_n(output, out.p, at);
-            buf_append_n(output, out.p + at + llen, out.len - at - llen);
-            buf_free(&out);
+            if (llen) {
+                memmove(out.p + at, out.p + at + llen, out.len - at - llen);
+                out.len -= llen;
+            }
+            out.p[out.len] = '\0';
+            buf_free(output);
+            *output = out; /* ownership moves; `out` is dead from here */
+            out.p = NULL;
             break;
         }
         /* dead, cancelled or timed out: salvage what came back, kill the
@@ -7040,17 +7109,16 @@ static void tool_show_call(const char *name, const char *summary)
 
 static void tool_show_exit(const char *output)
 {
-    char first[64] = "";
     const char *nl = strchr(output, '\n');
     size_t n = nl ? (size_t)(nl - output) : strlen(output);
-    if (n >= sizeof first)
-        n = sizeof first - 1;
-    memcpy(first, output, n);
-    first[n] = '\0';
+    if (n > 63)
+        n = 63; /* the status line carries the head of the result only */
+    /* print the slice with a precision instead of copying it to a stack
+     * buffer first: %.*s needs no terminator */
     if (g_emit_vt)
-        out_printf("\x1b[2m  %s\x1b[0m\r\n", first);
+        out_printf("\x1b[2m  %.*s\x1b[0m\r\n", (int)n, output);
     else
-        out_printf("  %s\r\n", first);
+        out_printf("  %.*s\r\n", (int)n, output);
 }
 
 static void tool_show_output(const char *output)
@@ -7083,8 +7151,8 @@ static void tool_show_output(const char *output)
 
     struct buf b = BUF_INIT;
     if (g_emit_vt)
-        buf_appends(&b, "\x1b[2m");
-    buf_appends(&b, "  ");
+        buf_append_lit(&b, "\x1b[2m");
+    buf_append_lit(&b, "  ");
     /* bulk-copy the runs between newlines: a buf_appendc per byte paid a
      * reserve check on every character of every tool output */
     for (const char *c = body; c < end;) {
@@ -7096,12 +7164,12 @@ static void tool_show_output(const char *output)
         buf_append_n(&b, c, (size_t)(eol - c));
         if (eol + 1 >= end)
             break;
-        buf_appends(&b, "\r\n  ");
+        buf_append_lit(&b, "\r\n  ");
         c = eol + 1;
     }
     if (g_emit_vt)
-        buf_appends(&b, "\x1b[0m");
-    buf_appends(&b, "\r\n");
+        buf_append_lit(&b, "\x1b[0m");
+    buf_append_lit(&b, "\r\n");
     out_write(b.p, b.len);
     buf_free(&b);
 }
@@ -7234,7 +7302,22 @@ static void config_free(struct config *cfg)
 struct session_log {
     HANDLE file;
     char *path;
+    struct buf w; /* user-space write buffer: a tool-heavy round logs N+2
+                   * records; they reach the file in ONE WriteFile at the
+                   * turn's end (or at 64 KB), in order. A crash costs at
+                   * most the unflushed turn, never a torn line. */
 };
+
+/* Flush the buffered records. Called at turn end, before any blocking wait
+ * for input, and on every lifecycle boundary that closes the log. */
+static void session_flush(struct session_log *sl)
+{
+    if (sl->w.len && sl->file) {
+        DWORD wrote = 0;
+        WriteFile(sl->file, sl->w.p, (DWORD)sl->w.len, &wrote, NULL);
+    }
+    buf_reset(&sl->w);
+}
 
 /* Point %LOCALAPPDATA%\kk\current at the session --continue should reopen:
  * every place a log becomes the active one writes this same pointer. */
@@ -7272,11 +7355,12 @@ static void session_write_line(struct session_log *sl, const char *data,
     session_touch(sl);
     if (!sl->file)
         return;
-    /* the newline rides in the caller's buffer: one WriteFile per line.
-     * Contract: data already ends with '\n' — a record without it glues
-     * to the next line and the loader drops both. */
-    DWORD wrote = 0;
-    WriteFile(sl->file, data, (DWORD)len, &wrote, NULL);
+    /* the newline rides in the caller's buffer — a record without it glues
+     * to the next line and the loader drops both. Contract unchanged; only
+     * the syscall count changed: buffered here, flushed once per turn. */
+    buf_append_n(&sl->w, data, len);
+    if (sl->w.len >= 64 * 1024)
+        session_flush(sl);
 }
 
 static void session_log_message(struct session_log *sl,
@@ -7490,9 +7574,11 @@ static void session_open(struct session_log *sl, int cont,
 
 static void session_close(struct session_log *sl)
 {
+    session_flush(sl);
     if (sl->file)
         CloseHandle(sl->file);
     free(sl->path);
+    buf_free(&sl->w);
     memset(sl, 0, sizeof *sl);
 }
 
@@ -9862,6 +9948,7 @@ static int run_repl(struct config *cfg)
             }
         } else if (line[0] == '/') {
             cmd_slash(cfg, line, &cv, &slog);
+            session_flush(&slog); /* /compact logs outside agent_loop */
         } else if (!cfg->model || !*cfg->model) {
             out_printf("未设置模型：请设置 KK_MODEL 或在 %s\\config 里配置\r\n",
                        g_appdata_dir);
@@ -10024,10 +10111,12 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
                        struct stream_state *st)
 {
     /* pre-size from the last request: a long conversation otherwise pays
-     * ~10 doubling reallocs (each copying the whole body) every round */
-    static size_t last_body;
+     * ~10 doubling reallocs (each copying the whole body) every round. The
+     * previous body itself survives below as the prefix-cache baseline, so
+     * its length doubles as the size hint — no separate counter needed. */
+    static struct buf prev_body;
     struct buf body = BUF_INIT;
-    buf_reserve(&body, last_body + 4096);
+    buf_reserve(&body, prev_body.len + 4096);
     buf_appends(&body, "{\"model\":\"");
     json_escape_append(&body, cfg->model, strlen(cfg->model));
     if (with_tools) {
@@ -10067,7 +10156,6 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
                 "],\"stream\":true,\"max_tokens\":%lld,"
                 "\"stream_options\":{\"include_usage\":true}}",
                 (long long)max_output_tokens());
-    last_body = body.len;
 
     struct chat_request cr;
     memset(&cr, 0, sizeof cr);
@@ -10075,11 +10163,24 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
     cr.hooks = *hooks;
     arena_init(&cr.arena, 64 * 1024);
 
-    /* join base_url + endpoint, tolerating a trailing slash */
-    size_t blen = strlen(cfg->base_url);
-    while (blen > 0 && cfg->base_url[blen - 1] == '/')
-        blen--;
-    char *url = xasprintf("%.*s/chat/completions", (int)blen, cfg->base_url);
+    /* join base_url + endpoint once per process: base_url is fixed at
+     * startup, and every round — plus every compaction request — used to
+     * rebuild and free this string */
+    static char *s_url;
+    static char *s_url_src;
+    if (!s_url_src || strcmp(s_url_src, cfg->base_url) != 0) {
+        size_t blen = strlen(cfg->base_url);
+        while (blen > 0 && cfg->base_url[blen - 1] == '/')
+            blen--;
+        char *fresh = xasprintf("%.*s/chat/completions", (int)blen,
+                                cfg->base_url);
+        if (fresh) {
+            free(s_url);
+            free(s_url_src);
+            s_url = fresh;
+            s_url_src = xstrdup(cfg->base_url);
+        }
+    }
 
     char *err_body = NULL;
     st->request_bytes = body.len;
@@ -10109,18 +10210,15 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
      * on a big body is our own instability; a big `shared` with
      * `cache_tokens` still 0 is the endpoint's. */
     {
-        static struct buf prev_body;
         size_t cmp = body.len < prev_body.len ? body.len : prev_body.len;
         size_t sh = 0;
         st->request_prev = prev_body.len != 0;
         while (sh < cmp && body.p[sh] == prev_body.p[sh])
             sh++;
         st->request_shared = sh;
-        buf_reset(&prev_body);
-        buf_append_n(&prev_body, body.p, body.len);
     }
-    int status = http_post_stream(url, cfg->api_key, body.p, 10000, 120000,
-                                  sse_on_bytes, &cr, &err_body);
+    int status = http_post_stream(s_url, cfg->api_key, body.p, body.len, 10000,
+                                  120000, sse_on_bytes, &cr, &err_body);
     if (status == 0 && err_body) {
         st->error = err_body; /* transport failure text */
         err_body = NULL;
@@ -10132,8 +10230,13 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
     }
     free(err_body);
 
-    buf_free(&body);
-    free(url);
+    /* the diagnostic above already consumed the previous body: keep THIS
+     * one for the next round by moving it, not copying it — one full body
+     * resident at a time, and its length pre-sizes the next round's build */
+    buf_free(&prev_body);
+    prev_body = body;
+    body = (struct buf)BUF_INIT; /* ownership moved: nothing may free it twice */
+
     sse_parser_free(&cr.sse);
     arena_free(&cr.arena);
     return status;
@@ -10977,6 +11080,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     }
     InterlockedExchange(&g_steer, 0); /* a steer aimed at an already-dead run */
     status_repaint(); /* the model name returns to the status row */
+    session_flush(slog); /* the turn's records land in one write */
     if (!g_dock && g_emit_vt)
         out_puts("\x1b[?25h"); /* dock mode: the editor re-shows it */
     return rc;
