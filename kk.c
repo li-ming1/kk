@@ -1700,10 +1700,70 @@ static void user_line_show(const char *text, size_t n)
     }
 }
 
+/* Nap for about ms, with two things Sleep cannot give on this machine: a wake
+ * at the millisecond asked for, and a wait somebody can cut short. Sleep's
+ * floor here is one clock tick — measured: Sleep(10) sleeps 16.1 ms and
+ * Sleep(1) also 16.1 ms — so anything polled on it notices finished work a
+ * tick late (a finished bash call cost 16 ms of that, the spinner below could
+ * only be reaped ~33 ms after a turn ended). A high-resolution waitable timer
+ * (Win10 1607+; the manifest already requires 1903) is per-object, so it does
+ * not raise the clock resolution for every other process, and `wake` is
+ * waited on alongside it so an owner can end the nap at once. Per thread,
+ * because two threads arming one timer would cut each other short. The Sleep
+ * fallback costs a tick and nothing more: both callers nap only until work
+ * appears. */
+static _Thread_local HANDLE g_nap_timer;
+
+static void kk_nap(DWORD ms, HANDLE wake)
+{
+    if (!g_nap_timer) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+        g_nap_timer = CreateWaitableTimerExW(
+            NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            SYNCHRONIZE | 0x3 /* TIMER_MODIFY_STATE | TIMER_QUERY_STATE */);
+        if (!g_nap_timer) {
+            Sleep(ms < 10 ? 10 : ms);
+            return;
+        }
+    }
+    LARGE_INTEGER due; /* negative due time = relative, in 100 ns units */
+    due.QuadPart = -(LONGLONG)ms * 10000;
+    if (!SetWaitableTimer(g_nap_timer, &due, 0, NULL, NULL, FALSE)) {
+        Sleep(ms < 10 ? 10 : ms);
+        return;
+    }
+    HANDLE h[2];
+    DWORD n = 0;
+    h[n++] = g_nap_timer;
+    if (wake)
+        h[n++] = wake;
+    WaitForMultipleObjects(n, h, FALSE, ms + 1000);
+}
+
+/* Release this thread's nap timer. The agent and spinner threads are created
+ * per turn, so a per-thread handle left behind would pile up one handle per
+ * turn for the rest of the session. */
+static void nap_thread_end(void)
+{
+    if (g_nap_timer) {
+        CancelWaitableTimer(g_nap_timer);
+        CloseHandle(g_nap_timer);
+        g_nap_timer = NULL;
+    }
+}
+
 /* Wait spinner: the sole animator of the pinned status line, running
  * for the whole turn (wait, stream, tools) — the row belongs to it, so
  * nothing can fight it for pixels. Never paints without VT (pipes stay
  * clean for scripted use). */
+
+/* Set by the turn-end path so the spinner stops napping out its frame before
+ * it is joined: that nap was the gap between an answer ending and the
+ * composer taking input again. Auto-reset, created on first use, lives as
+ * long as the process. */
+static HANDLE g_spinner_wake;
 
 static DWORD WINAPI spinner_thread(LPVOID arg)
 {
@@ -1711,11 +1771,13 @@ static DWORD WINAPI spinner_thread(LPVOID arg)
     for (;;) {
         int busy = (int)g_busy;
         if (busy == 0 || !g_emit_vt)
-            return 0;
+            break;
         InterlockedIncrement(&g_frame);
         status_repaint();
-        Sleep(90);
+        kk_nap(90, g_spinner_wake);
     }
+    nap_thread_end();
+    return 0;
 }
 
 /* Wide-string helpers for Win32 boundary calls. The length form is the
@@ -6079,7 +6141,7 @@ static int shell_run(struct str command,
             }
             /* the status line (spinner thread) shows the tool label and
              * elapsed time; the poll loop here only watches the pipe */
-            Sleep(10);
+            kk_nap(2, NULL);
         }
 
         if (have_marker) {
@@ -6090,7 +6152,12 @@ static int shell_run(struct str command,
              * pipe; wait briefly for it — but only when stderr actually
              * sent something, so clean calls pay nothing */
             if (strstr(out.p, "#< CLIXML")) {
-                for (int quiet = 0; quiet < 30;) {
+                /* Give the trailing stream a deadline, not a poll count: 30
+                 * polls were 30 clock quanta, ~493 ms measured on a 34-byte
+                 * call. What the loop is really about is silence after the
+                 * last byte, so measure that in milliseconds. */
+                DWORD quiet_since = GetTickCount();
+                for (;;) {
                     DWORD avail = 0;
                     if (!PeekNamedPipe(g_ps_out_r, NULL, 0, NULL, &avail,
                                        NULL))
@@ -6103,11 +6170,12 @@ static int shell_run(struct str command,
                                      &got, NULL)
                             && got > 0)
                             buf_append_n(&out, tmp, got);
-                        quiet = 0;
+                        quiet_since = GetTickCount();
                         continue;
                     }
-                    Sleep(10);
-                    quiet++;
+                    if (GetTickCount() - quiet_since >= 120)
+                        break;
+                    kk_nap(2, NULL);
                 }
             }
             /* drop the marker line itself from the middle of the stream */
@@ -8939,6 +9007,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID arg)
     struct agent_args *a = arg;
     agent_loop(a->cfg, a->cv, a->slog, a->sysp, 1);
     out_printf_thread_end();
+    nap_thread_end(); /* this thread ran the tools, and napped in them */
     free(a);
     return 0;
 }
@@ -10171,6 +10240,14 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         conv_compact(cfg, cv, slog);
     InterlockedExchange(&g_busy, 0);
     if (spinner) {
+        /* End the spinner's frame nap rather than waiting it out: the join
+         * cost up to ~33 ms of dead air between the answer ending and the
+         * composer taking input again. If it already exited, the auto-reset
+         * event stays armed and only buys the next turn one early frame. */
+        if (!g_spinner_wake)
+            g_spinner_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (g_spinner_wake)
+            SetEvent(g_spinner_wake);
         WaitForSingleObject(spinner, 3000);
         CloseHandle(spinner);
     }
