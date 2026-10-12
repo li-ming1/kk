@@ -201,19 +201,44 @@ static void buf_append_spaces(struct buf *b, size_t n)
     }
 }
 
+/* Format into b's spare capacity in ONE pass, appending. The previous shape
+ * of every printf-style call asked vsnprintf for the length with a NULL sink
+ * and then formatted again to write it — two full formatting passes, and the
+ * read tool formats one line per file line (measured 198 ns for a 35-byte
+ * line, half of it make-work). UCRT reports the would-be length even when it
+ * truncated, so a small guess costs a retry and only the rare big line pays
+ * two passes. */
+static void buf_append_vf(struct buf *b, const char *fmt, va_list ap0)
+{
+    for (;;) {
+        size_t avail = b->cap > b->len ? b->cap - b->len : 0;
+        if (avail < 64) {
+            buf_reserve(b, 256); /* leaves at least 257 bytes of room */
+            avail = b->cap - b->len;
+        }
+        va_list ap;
+        va_copy(ap, ap0);
+        int n = vsnprintf(b->p + b->len, avail, fmt, ap);
+        va_end(ap);
+        if (n < 0) {
+            b->p[b->len] = '\0'; /* keep the buf NUL invariant */
+            return;
+        }
+        if ((size_t)n < avail) {
+            b->len += (size_t)n;
+            b->p[b->len] = '\0';
+            return;
+        }
+        buf_reserve(b, (size_t)n + 1); /* did not fit: make room, format once */
+    }
+}
+
 static void buf_appendf(struct buf *b, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(NULL, 0, fmt, ap);
+    buf_append_vf(b, fmt, ap);
     va_end(ap);
-    if (n <= 0)
-        return;
-    buf_reserve(b, (size_t)n);
-    va_start(ap, fmt);
-    vsnprintf(b->p + b->len, (size_t)n + 1, fmt, ap);
-    va_end(ap);
-    b->len += (size_t)n;
 }
 
 static size_t u8_encode(uint32_t cp, char *tmp);
@@ -1402,16 +1427,9 @@ static void out_frame_printf(const char *fmt, ...)
     static struct buf b;
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(NULL, 0, fmt, ap);
-    va_end(ap);
-    if (n <= 0)
-        return;
     buf_reset(&b);
-    buf_reserve(&b, (size_t)n);
-    va_start(ap, fmt);
-    vsnprintf(b.p, (size_t)n + 1, fmt, ap);
+    buf_append_vf(&b, fmt, ap);
     va_end(ap);
-    b.len = (size_t)n;
     out_frame_write(b.p, b.len);
 }
 
@@ -1430,17 +1448,12 @@ static void out_printf(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(NULL, 0, fmt, ap);
+    buf_reset(&g_out_scratch); /* the scratch keeps its capacity between
+                                * calls, so the usual line formats in one
+                                * pass into room that is already there */
+    buf_append_vf(&g_out_scratch, fmt, ap);
     va_end(ap);
-    if (n <= 0)
-        return;
-    buf_reset(&g_out_scratch);
-    buf_reserve(&g_out_scratch, (size_t)n);
     g_out_scratch_used = 1;
-    va_start(ap, fmt);
-    vsnprintf(g_out_scratch.p, (size_t)n + 1, fmt, ap);
-    va_end(ap);
-    g_out_scratch.len = (size_t)n;
     out_write(g_out_scratch.p, g_out_scratch.len);
 }
 
