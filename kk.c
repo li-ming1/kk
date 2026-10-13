@@ -565,61 +565,91 @@ static size_t jstr_escape(const char *s, size_t n, size_t i)
  * quotes (when out is given) and the index past the closing quote, or
  * (size_t)-1.
  *
- * The first 24 bytes are always walked byte by byte: the measured crossover
- * where memchr starts winning is ~24 bytes, and envelope keys plus short
- * values ("stop", ids, small argument fragments) end inside it — each of them
- * then pays zero vector calls, whose fixed cost is the whole price at these
- * lengths. Longer strings (model content, tool arguments) fall through to
- * memchr windows. Both scans stay inside one window, so an escape never
- * re-scans from the quote (that is quadratic in the escape count). */
+ * The first 24 bytes are the probe: envelope keys plus short values ("stop",
+ * ids, small argument fragments) end inside it, and an SSE2 block decides 16
+ * of those bytes at once — the vector compare is the whole price at these
+ * lengths, and the load stays inside the buffer. Longer strings (model
+ * content, tool arguments) fall through to memchr windows. Both scans stay
+ * inside one window, so an escape never re-scans from the quote (that is
+ * quadratic in the escape count). */
 #define JSTR_WINDOW 1024
 #define JSTR_PROBE 24
+
+/* First '"' or '\\' inside s[0..probe): the index, or probe when neither
+ * occurs. One SSE2 block covers 16 of the probe's 24 bytes — envelope keys
+ * ("choices", "reasoning_content") and short values ("stop", ids) end
+ * inside it, and the vector compare replaces 16 pairs of scalar compares.
+ * The load stays inside [s, s+n) because k+16 <= probe <= n-i. */
+static size_t jstr_probe_hit(const char *s, size_t i, size_t probe)
+{
+    size_t k = 0;
+#if defined(_M_X64)
+    const __m128i vq = _mm_set1_epi8('"');
+    const __m128i vb = _mm_set1_epi8('\\');
+    while (k + 16 <= probe) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(s + i + k));
+        unsigned m = (unsigned)_mm_movemask_epi8(
+            _mm_or_si128(_mm_cmpeq_epi8(v, vq), _mm_cmpeq_epi8(v, vb)));
+        if (m) {
+            unsigned long bit;
+            _BitScanForward(&bit, m);
+            return k + (size_t)bit;
+        }
+        k += 16;
+    }
+#endif
+    while (k < probe) {
+        unsigned char c = (unsigned char)s[i + k];
+        if (c == '"' || c == '\\')
+            return k;
+        k++;
+    }
+    return probe;
+}
+
 static size_t jstr_end(const char *s, size_t n, size_t i, struct str *out)
 {
     size_t start = i;
     while (i < n) {
         size_t probe = n - i < JSTR_PROBE ? n - i : JSTR_PROBE;
-        size_t k = 0;
-        while (k < probe) {
-            unsigned char c = (unsigned char)s[i + k];
-            if (c == '"') {
+        size_t k = jstr_probe_hit(s, i, probe);
+        if (k < probe) {
+            if (s[i + k] == '"') {
                 if (out) {
                     out->p = s + start;
                     out->n = i + k - start;
                 }
                 return i + k + 1;
             }
-            if (c == '\\') {
-                i = jstr_escape(s, n, i + k);
-                if (i == (size_t)-1)
-                    return (size_t)-1;
-                break; /* resume the probe after the escape */
-            }
-            k++;
+            i = jstr_escape(s, n, i + k);
+            if (i == (size_t)-1)
+                return (size_t)-1;
+            continue; /* resume the probe after the escape */
         }
-        if (k < probe)
-            continue; /* an escape was handled */
         if (probe < JSTR_PROBE)
             return (size_t)-1; /* buffer exhausted: unterminated */
         i += JSTR_PROBE;
 
+        /* window phase: ONE pass finds either delimiter. The old shape ran
+         * memchr for '"' across the window and then a second memchr for
+         * '\\' bounded by that quote — escape-free strings (the norm) paid
+         * the same range twice. jstr_probe_hit is the same 16-byte vector
+         * compare, so one pass decides. */
         size_t rest = n - i;
         size_t win = rest > JSTR_WINDOW ? JSTR_WINDOW : rest;
-        const char *q = (const char *)memchr(s + i, '"', win);
-        const char *b = (const char *)memchr(s + i, '\\',
-                                            q ? (size_t)(q - (s + i)) : win);
-        if (b) { /* an escape comes first, or there is no quote before it */
-            i = jstr_escape(s, n, (size_t)(b - s));
+        size_t k2 = jstr_probe_hit(s, i, win);
+        if (k2 < win) {
+            if (s[i + k2] == '"') {
+                if (out) {
+                    out->p = s + start;
+                    out->n = i + k2 - start;
+                }
+                return i + k2 + 1;
+            }
+            i = jstr_escape(s, n, i + k2);
             if (i == (size_t)-1)
                 return (size_t)-1;
             continue;
-        }
-        if (q) {
-            if (out) {
-                out->p = s + start;
-                out->n = (size_t)(q - s) - start;
-            }
-            return (size_t)(q - s) + 1;
         }
         i += win; /* nothing interesting in this window */
     }
@@ -11222,12 +11252,18 @@ static int goal_loop(struct config *cfg, struct conversation *cv,
                    (long long)round, (long long)max_rounds,
                    (long long)spent);
         /* the nudge is the user turn the next round answers — tagged, so
-         * the "human spoke" check above can tell it apart from real input */
+         * the "human spoke" check above can tell it apart from real input.
+         * The remaining budget rides along: a model that knows the clock is
+         * near can prioritize instead of spending the last round on setup. */
         struct buf nudge = BUF_INIT;
         buf_appendf(&nudge,
                     GOAL_TAG "·第 %lld 轮：继续推进上面的任务，尚未完成就"
-                    "不要停；全部完成时以 ✅ 开头收尾。",
-                    (long long)(round + 1));
+                    "不要停；全部完成时以 ✅ 开头收尾。（剩余约 %lld 轮 / "
+                    "%lld 分钟）",
+                    (long long)(round + 1),
+                    (long long)(max_rounds - round),
+                    (long long)(max_minutes
+                                - (GetTickCount() - t0) / 60000));
         struct message *nm = conv_add_take(cv, "user", buf_detach(&nudge));
         session_log_message(slog, nm);
         user_line_show(nm->content, strlen(nm->content));
