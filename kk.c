@@ -508,15 +508,18 @@ struct json_parser {
 
 #define JSON_MAX_DEPTH 64
 
-static void jskip_ws(struct json_parser *p)
+/* Skip JSON whitespace from index i. The parser and the protocol fast scan
+ * share this one reader: two copies of the whitespace rule is two places for
+ * them to disagree. */
+static size_t jw(const char *s, size_t n, size_t i)
 {
-    while (p->i < p->n) {
-        char c = p->s[p->i];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
-            p->i++;
-        else
+    while (i < n) {
+        char c = s[i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
             break;
+        i++;
     }
+    return i;
 }
 
 static struct jnode *jnew(struct json_parser *p, uint8_t tag)
@@ -679,13 +682,26 @@ static int jdecode_u(const char *s, size_t n, size_t *i, uint32_t *cp)
     return 0;
 }
 
+/* First '\\' in s[0..n), or NULL. SSE deltas are a handful of bytes, where
+ * the memchr call overhead is the whole cost: short strings scan by hand,
+ * long ones (file contents, tool arguments) get the vectorized scan. */
+static const char *find_backslash(const char *s, size_t n)
+{
+    if (n > 32)
+        return (const char *)memchr(s, '\\', n);
+    for (size_t k = 0; k < n; k++)
+        if (s[k] == '\\')
+            return s + k;
+    return NULL;
+}
+
 /* Decode a raw string slice (with escapes) into buf as UTF-8. Escape-free
  * runs are copied in bulk — model deltas are almost never escaped. */
 static void jdecode_str(struct str raw, struct buf *out)
 {
     size_t i = 0;
     while (i < raw.n) {
-        const char *bs = memchr(raw.p + i, '\\', raw.n - i);
+        const char *bs = find_backslash(raw.p + i, raw.n - i);
         if (!bs) {
             buf_append_n(out, raw.p + i, raw.n - i);
             break;
@@ -780,17 +796,17 @@ static struct jnode *jparse_object(struct json_parser *p)
     p->i++; /* { */
     struct jnode *obj = jnew(p, J_OBJ);
     struct jnode **tail = &obj->head;
-    jskip_ws(p);
+    p->i = jw(p->s, p->n, p->i);
     if (p->i < p->n && p->s[p->i] == '}') {
         p->i++;
         return obj;
     }
     for (;;) {
-        jskip_ws(p);
+        p->i = jw(p->s, p->n, p->i);
         struct str key;
         if (jparse_string_raw(p, &key) != 0)
             return NULL;
-        jskip_ws(p);
+        p->i = jw(p->s, p->n, p->i);
         if (p->i >= p->n || p->s[p->i] != ':')
             return NULL;
         p->i++;
@@ -802,7 +818,7 @@ static struct jnode *jparse_object(struct json_parser *p)
         pair->val = val;
         *tail = pair;
         tail = &pair->next;
-        jskip_ws(p);
+        p->i = jw(p->s, p->n, p->i);
         if (p->i < p->n && p->s[p->i] == ',') {
             p->i++;
             continue;
@@ -820,7 +836,7 @@ static struct jnode *jparse_array(struct json_parser *p)
     p->i++; /* [ */
     struct jnode *arr = jnew(p, J_ARR);
     struct jnode **tail = &arr->head;
-    jskip_ws(p);
+    p->i = jw(p->s, p->n, p->i);
     if (p->i < p->n && p->s[p->i] == ']') {
         p->i++;
         return arr;
@@ -831,7 +847,7 @@ static struct jnode *jparse_array(struct json_parser *p)
             return NULL;
         *tail = val;
         tail = &val->next;
-        jskip_ws(p);
+        p->i = jw(p->s, p->n, p->i);
         if (p->i < p->n && p->s[p->i] == ',') {
             p->i++;
             continue;
@@ -849,7 +865,7 @@ static struct jnode *jparse_value(struct json_parser *p)
     if (++p->depth > JSON_MAX_DEPTH)
         return NULL;
     struct jnode *result = NULL;
-    jskip_ws(p);
+    p->i = jw(p->s, p->n, p->i);
     if (p->i >= p->n)
         goto out;
     char c = p->s[p->i];
@@ -1484,7 +1500,8 @@ static void content_seek_write(const char *s, size_t n)
         /* chat-style bottom alignment: when the transcript ends above the
          * region bottom, scroll the region down so output hugs the panel
          * and the spare rows live at the top (future scrollback). Once
-         * aligned the region scrolls normally and the gap stays zero. */        int rbottom = csbi.srWindow.Top + g_region_bottom - 1;
+         * aligned the region scrolls normally and the gap stays zero. */
+        int rbottom = csbi.srWindow.Top + g_region_bottom - 1;
         int gap = rbottom - g_content_y;
         if (gap > 0) {
             if (gap > g_region_bottom)
@@ -4106,17 +4123,6 @@ struct delta_hit {
     int n_calls;
 };
 
-static size_t jw(const char *s, size_t n, size_t i)
-{
-    while (i < n) {
-        char c = s[i];
-        if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
-            break;
-        i++;
-    }
-    return i;
-}
-
 /* A string literal at s[i] (which must be the opening quote): the slice
  * between the quotes and the index past the closing one, or (size_t)-1.
  * Delegates to jstr_end, so the escape rules are literally the parser's. */
@@ -4740,12 +4746,22 @@ static int content_looping(const struct buf *b)
     if (p < b->p)
         p = b->p;
     int hits = 0;
-    for (; p + LOOP_BLK <= tail; p++) {
-        if (*p != tail[0] || memcmp(p, tail, LOOP_BLK) != 0)
-            continue;
-        if (++hits >= 2)
-            return 1;
-        p += LOOP_BLK - 1;
+    /* the first byte decides almost every position: memchr scans it
+     * vectorized, the memcmp only runs on a first-byte hit. The span stops
+     * at the last legal start (tail - LOOP_BLK), exactly like the scalar
+     * loop's condition did. */
+    for (; p + LOOP_BLK <= tail;) {
+        size_t span = (size_t)(tail - LOOP_BLK - p) + 1;
+        const char *hit = (const char *)memchr(p, tail[0], span);
+        if (!hit)
+            break;
+        if (memcmp(hit, tail, LOOP_BLK) == 0) {
+            if (++hits >= 2)
+                return 1;
+            p = hit + LOOP_BLK;
+        } else {
+            p = hit + 1;
+        }
     }
     return 0;
 }
@@ -5145,7 +5161,7 @@ static struct str args_get(struct args *a, const char *key)
     struct jnode *v = jobj_get(a->j, key);
     if (!v || v->tag != J_STR)
         return (struct str){ NULL, 0 };
-    if (!memchr(v->raw.p, '\\', v->raw.n))
+    if (!find_backslash(v->raw.p, v->raw.n))
         return v->raw;
     size_t at = a->b.len;
     jdecode_str(v->raw, &a->b);
@@ -5364,6 +5380,9 @@ static int file_locked(struct str path)
 }
 
 /* --- fff: fuzzy file finder + content grep (Rust cdylib) ---------------- */
+
+/* Both index tools refuse the same way when the DLL is absent. */
+#define FFF_UNAVAIL_ERR "error: 文件索引不可用（fff DLL 未随 kk.exe 提供）"
 
 /* The DLL ships next to kk.exe and loads lazily on the first find/grep
  * tool call. Without it those tools return an error and the agent falls
@@ -5607,7 +5626,7 @@ static char *tool_find(const struct jnode *args, struct tool_img *img_)
         goto cleanup;
     }
     if (!fff_ensure()) {
-        result = xstrdup("error: 文件索引不可用（fff DLL 未随 kk.exe 提供）");
+        result = xstrdup(FFF_UNAVAIL_ERR);
         goto cleanup;
     }
     int64_t off = args_int(args, "offset", 0);
@@ -5689,7 +5708,7 @@ static char *tool_grep(const struct jnode *args, struct tool_img *img_)
         goto cleanup;
     }
     if (!fff_ensure()) {
-        result = xstrdup("error: 文件索引不可用（fff DLL 未随 kk.exe 提供）");
+        result = xstrdup(FFF_UNAVAIL_ERR);
         goto cleanup;
     }
     struct jnode *rx = jobj_get(args, "regex");
@@ -8065,6 +8084,7 @@ static const struct {
 } KK_COMMANDS[] = {
     { "/new", "开启全新会话" },
     { "/resume", "切换到其他会话" },
+    { "/goal", "自主目标模式：长任务连续推进，✅ 收尾" },
     { "/skills", "列出模型可按需读取的 skill" },
     { "/compact", "把早期历史压缩为摘要" },
 };
@@ -9720,19 +9740,30 @@ static void repl_banner(void)
 }
 
 /* Agent turn thread: one live turn at a time, while the composer keeps
- * the main thread for the whole session. */
+ * the main thread for the whole session. goal != NULL runs /goal's
+ * autonomous loop instead of a single turn. */
 struct agent_args {
     struct config *cfg;
     struct conversation *cv;
     struct session_log *slog;
     const char *sysp;
+    char *goal;
 };
 static HANDLE g_agent_thread;
+
+static int goal_loop(struct config *cfg, struct conversation *cv,
+                     struct session_log *slog, const char *system_prompt,
+                     const char *task);
 
 static DWORD WINAPI agent_thread_proc(LPVOID arg)
 {
     struct agent_args *a = arg;
-    agent_loop(a->cfg, a->cv, a->slog, a->sysp, 1);
+    if (a->goal) {
+        goal_loop(a->cfg, a->cv, a->slog, a->sysp, a->goal);
+        free(a->goal);
+    } else {
+        agent_loop(a->cfg, a->cv, a->slog, a->sysp, 1);
+    }
     out_printf_thread_end();
     nap_thread_end(); /* this thread ran the tools, and napped in them */
     free(a);
@@ -9862,6 +9893,40 @@ static int run_repl(struct config *cfg)
                 queue_user_line(line);
                 InterlockedExchange(&g_steer, 1);
                 InterlockedExchange(&g_cancel, 1);
+            }
+        } else if (line[0] == '/' && strncmp(line, "/goal", 5) == 0
+                   && (line[5] == '\0' || line[5] == ' ')) {
+            /* /goal <task>: autonomous rounds until ✅, a budget, or the
+             * human. goal_loop owns the task text as its first user turn. */
+            const char *task = line + 5;
+            while (*task == ' ')
+                task++;
+            if (!*task) {
+                out_puts("用法：/goal <任务描述>（自主连续推进；完成时以 ✅ "
+                         "收尾；Ctrl+C 随时中止）\r\n");
+            } else if (!cfg->model || !*cfg->model) {
+                out_printf("未设置模型：请设置 KK_MODEL 或在 %s\\config 里配置\r\n",
+                           g_appdata_dir);
+            } else if (dock) {
+                if (g_agent_thread)
+                    CloseHandle(g_agent_thread); /* previous turn, reaped */
+                struct agent_args *aa = xmalloc(sizeof *aa);
+                aa->cfg = cfg;
+                aa->cv = &cv;
+                aa->slog = &slog;
+                aa->sysp = sysp;
+                aa->goal = xstrdup(task);
+                g_agent_thread = CreateThread(NULL, 0, agent_thread_proc, aa,
+                                              0, NULL);
+                if (!g_agent_thread) {
+                    /* no thread available: run the goal synchronously */
+                    free(aa->goal);
+                    free(aa);
+                    goal_loop(cfg, &cv, &slog, sysp, task);
+                }
+            } else {
+                /* non-dock console: synchronous goal */
+                goal_loop(cfg, &cv, &slog, sysp, task);
             }
         } else if (line[0] == '/') {
             cmd_slash(cfg, line, &cv, &slog);
@@ -10561,6 +10626,11 @@ static void para_slot_free(struct para_slot *s)
  * tail every frame, and a visible cursor just jumps around the output;
  * the composer paints a block caret in the draft instead. In dock mode
  * the editor re-shows the cursor when the turn ends. */
+
+/* The finished turn's token totals: /goal accumulates them into its budget.
+ * Zero when the endpoint reported no usage. */
+static int64_t g_last_turn_in, g_last_turn_out;
+
 static int agent_loop(struct config *cfg, struct conversation *cv,
                       struct session_log *slog, const char *system_prompt,
                       int auto_compact)
@@ -10575,6 +10645,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     int turn_prev = 0;
     size_t last_request_bytes = 0;
     int compacted_once = 0;
+    g_last_turn_in = g_last_turn_out = 0;
     /* turn-level state: spinner and timer run for the whole turn (all
      * model rounds + tool executions), not per round */
     InterlockedExchange(&g_busy, 1);
@@ -10963,6 +11034,9 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         }
     }
     if (turn_usage) {
+        /* /goal's budget accounting reads these after the turn returns */
+        g_last_turn_in = turn_in;
+        g_last_turn_out = turn_out;
         /* once per user turn: in/out token counts, prompt cache hit rate
          * and total wall time, then a blank row for the next composer */
         char fs[16];
@@ -11044,6 +11118,120 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     if (!g_dock && g_emit_vt)
         out_puts("\x1b[?25h"); /* dock mode: the editor re-shows it */
     return rc;
+}
+
+/* --- /goal: bounded autonomous mode --------------------------------------
+ * One large task delivered without the user re-typing "继续" between rounds.
+ * Nothing new is built here: every round IS a full agent_loop (stream,
+ * tools, display, session log, auto-compaction), so a goal run behaves
+ * exactly like one long turn — it just continues itself with a tagged nudge
+ * instead of waiting for keystrokes. Three hard stops, any of which ends it:
+ * the model prefixes its final answer with ✅ (the protocol it was given),
+ * a budget (rounds / wall-clock / tokens, env-tunable), or the human — a
+ * Ctrl+C round or any real user message hands control straight back. */
+#define GOAL_DONE_MARK "\xE2\x9C\x85"                          /* ✅ */
+#define GOAL_TAG       "\xE7\x9B\xAE\xE6\xA0\x87\xE6\xA8\xA1\xE5\xBC\x8F" /* 目标模式 */
+
+/* Env-tunable budget reader; a goal is a large task by definition, so the
+ * defaults are generous. A missing or absurd value falls back. */
+static int64_t goal_budget(const char *name, int64_t fallback)
+{
+    char *e = env_get(name);
+    if (!e)
+        return fallback;
+    const char *p = e; /* str_to_i64 advances its cursor: keep the block */
+    int64_t v = str_to_i64(&p);
+    free(e);
+    return v >= 1 ? v : fallback;
+}
+
+static int goal_loop(struct config *cfg, struct conversation *cv,
+                     struct session_log *slog, const char *system_prompt,
+                     const char *task)
+{
+    int64_t max_rounds = goal_budget("KK_GOAL_ROUNDS", 50);
+    int64_t max_minutes = goal_budget("KK_GOAL_MINUTES", 60);
+    int64_t max_tokens = goal_budget("KK_GOAL_TOKENS", 5000000);
+    DWORD t0 = GetTickCount();
+    int64_t spent = 0;
+
+    /* the goal and its protocol ride in the first user message: the model
+     * must know it is autonomous, how to finish, and that it has a budget */
+    struct buf first = BUF_INIT;
+    buf_appendf(&first,
+                GOAL_TAG "·自主任务：%s\n"
+                "规则：自主连续推进，不要向用户提问或等待确认；每轮尽量批量"
+                "并行调用工具，减少往返；全部完成时，最终回复的第一行以 ✅ "
+                "开头并附简要总结；尚未完成就继续工作。",
+                task);
+    struct message *um = conv_add_take(cv, "user", buf_detach(&first));
+    attach_user_images(um, task);
+    session_log_message(slog, um);
+
+    char tok[24];
+    if (max_tokens >= 1000000)
+        snprintf(tok, sizeof tok, "%.1fM", (double)max_tokens / 1e6);
+    else
+        snprintf(tok, sizeof tok, "%lld", (long long)max_tokens);
+    out_printf(vt_or("\x1b[36m🎯 目标模式\x1b[0m \x1b[2m预算 %lld 轮 / %lld "
+                     "分钟 / %s tokens · Ctrl+C 随时中止\x1b[0m\r\n",
+                     "🎯 目标模式 预算 %lld 轮 / %lld 分钟 / %s tokens"
+                     " · Ctrl+C 随时中止\r\n"),
+               (long long)max_rounds, (long long)max_minutes, tok);
+
+    for (int64_t round = 1;; round++) {
+        int rc = agent_loop(cfg, cv, slog, system_prompt, 1);
+        spent += g_last_turn_in + g_last_turn_out;
+        if (rc != 0) {
+            /* Ctrl+C (130) or a failed round: the human is back in control */
+            out_puts("🎯 目标模式已停止\r\n");
+            return rc;
+        }
+        size_t ai = conv_rfind(cv, "assistant");
+        if (ai != cv->msgs.n && cv->msgs.p[ai].content
+            && strncmp(cv->msgs.p[ai].content, GOAL_DONE_MARK,
+                       sizeof GOAL_DONE_MARK - 1) == 0) {
+            out_printf(vt_or("\x1b[2m🎯 目标完成：%lld 轮 · in+out %lld "
+                             "tokens\x1b[0m\r\n",
+                             "🎯 目标完成：%lld 轮 · in+out %lld tokens\r\n"),
+                       (long long)round, (long long)spent);
+            return 0;
+        }
+        /* a real user message (a steer, queued input) is untagged: a goal
+         * run never overrules the human — hand control back */
+        size_t ui = conv_rfind(cv, "user");
+        if (ui != cv->msgs.n && cv->msgs.p[ui].content
+            && strncmp(cv->msgs.p[ui].content, GOAL_TAG,
+                       sizeof GOAL_TAG - 1) != 0) {
+            out_puts("🎯 检测到你的输入，目标模式交还控制权\r\n");
+            return 0;
+        }
+        if (round >= max_rounds
+            || (GetTickCount() - t0) / 60000 >= (DWORD)max_minutes
+            || spent >= max_tokens) {
+            out_printf(vt_or("\x1b[2m🎯 预算用尽，目标模式停止（已完成 %lld "
+                             "轮 · in+out %lld tokens）\x1b[0m\r\n",
+                             "🎯 预算用尽，目标模式停止（已完成 %lld 轮 · "
+                             "in+out %lld tokens）\r\n"),
+                       (long long)round, (long long)spent);
+            return 0;
+        }
+        out_printf(vt_or("\x1b[2m🎯 第 %lld/%lld 轮 · 累计 in+out %lld "
+                         "tokens\x1b[0m\r\n",
+                         "🎯 第 %lld/%lld 轮 · 累计 in+out %lld tokens\r\n"),
+                   (long long)round, (long long)max_rounds,
+                   (long long)spent);
+        /* the nudge is the user turn the next round answers — tagged, so
+         * the "human spoke" check above can tell it apart from real input */
+        struct buf nudge = BUF_INIT;
+        buf_appendf(&nudge,
+                    GOAL_TAG "·第 %lld 轮：继续推进上面的任务，尚未完成就"
+                    "不要停；全部完成时以 ✅ 开头收尾。",
+                    (long long)(round + 1));
+        struct message *nm = conv_add_take(cv, "user", buf_detach(&nudge));
+        session_log_message(slog, nm);
+        user_line_show(nm->content, strlen(nm->content));
+    }
 }
 
 static const char KK_HELP[] =
