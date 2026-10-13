@@ -2412,6 +2412,11 @@ static void painter_emit_sgr(struct painter *p, struct buf *sink)
 
 static void painter_start_row(struct painter *p)
 {
+    /* a resize mid-stream: the composer keeps polling the size, so wrap at
+     * the new width from this row on. Committed rows keep their old wrap —
+     * the console reflows its own buffer on resize anyway. */
+    if (p->cols != g_term_cols)
+        painter_set_width(p, g_term_cols);
     painter_layout(p);
     p->row_open = 1;
     p->row_shown = 0;
@@ -5892,6 +5897,80 @@ static uint32_t png_adler32(const unsigned char *data, size_t n)
     return (b << 16) | a;
 }
 
+/* Pixel dimensions from an image's header only (no decode: the point is to
+ * refuse what the endpoint would refuse BEFORE paying a round for a rejected
+ * request). Returns 0 when the shape was read. */
+static int image_dims_of(const char *data, size_t len, const char *mime,
+                         int *pw, int *ph)
+{
+    const unsigned char *d = (const unsigned char *)data;
+    if (strcmp(mime, "image/png") == 0) {
+        if (len < 24)
+            return -1;
+        *pw = (int)((uint32_t)d[16] << 24 | (uint32_t)d[17] << 16
+                   | (uint32_t)d[18] << 8 | d[19]);
+        *ph = (int)((uint32_t)d[20] << 24 | (uint32_t)d[21] << 16
+                   | (uint32_t)d[22] << 8 | d[23]);
+        return (*pw > 0 && *ph > 0) ? 0 : -1;
+    }
+    if (strcmp(mime, "image/gif") == 0) {
+        if (len < 10)
+            return -1;
+        *pw = d[6] | (d[7] << 8);
+        *ph = d[8] | (d[9] << 8);
+        return 0;
+    }
+    if (strcmp(mime, "image/webp") == 0) {
+        if (len < 30 || memcmp(d + 12, "VP8", 3) != 0)
+            return -1;
+        if (d[15] == ' ') { /* lossy: 14-bit dims after the start code */
+            *pw = (int)(((uint32_t)d[26] | ((uint32_t)d[27] << 8)) & 0x3FFF);
+            *ph = (int)(((uint32_t)d[28] | ((uint32_t)d[29] << 8)) & 0x3FFF);
+            return 0;
+        }
+        if (d[15] == 'L') { /* lossless: two 14-bit fields, 1-based */
+            uint32_t b = (uint32_t)d[21] | ((uint32_t)d[22] << 8)
+                       | ((uint32_t)d[23] << 16) | ((uint32_t)d[24] << 24);
+            *pw = (int)(b & 0x3FFF) + 1;
+            *ph = (int)((b >> 14) & 0x3FFF) + 1;
+            return 0;
+        }
+        if (d[15] == 'X') { /* extended: 24-bit dims minus one */
+            *pw = (int)((uint32_t)d[24] | ((uint32_t)d[25] << 8)
+                      | ((uint32_t)d[26] << 16)) + 1;
+            *ph = (int)((uint32_t)d[27] | ((uint32_t)d[28] << 8)
+                      | ((uint32_t)d[29] << 16)) + 1;
+            return 0;
+        }
+        return -1;
+    }
+    if (strcmp(mime, "image/jpeg") == 0) {
+        size_t i = 2; /* past SOI */
+        while (i + 9 < len) {
+            if (d[i] != 0xFF)
+                return -1;
+            unsigned m = d[i + 1];
+            if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) {
+                i += 2; /* standalone markers carry no payload */
+                continue;
+            }
+            if (m == 0xD9)
+                return -1; /* EOI before any frame header */
+            unsigned seg = (unsigned)d[i + 2] << 8 | d[i + 3];
+            if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+                *ph = (int)(((unsigned)d[i + 5] << 8) | d[i + 6]);
+                *pw = (int)(((unsigned)d[i + 7] << 8) | d[i + 8]);
+                return 0;
+            }
+            if (seg < 2)
+                return -1;
+            i += 2 + seg;
+        }
+        return -1;
+    }
+    return -1;
+}
+
 /* Long-edge cap for attached images. Vision endpoints downscale anything
  * past ~1568px themselves AND refuse base64 bodies over 5-10MB, so a 4K
  * screenshot used to encode to a ~25MB PNG (a ~33MB request: rejected, or
@@ -5905,6 +5984,31 @@ static int64_t img_max_edge(void)
         read = 1;
         cached = 1568;
         char *e = env_get("KK_IMG_MAX_EDGE");
+        if (e) {
+            int64_t v = 0;
+            for (const char *p = e; *p >= '0' && *p <= '9'; p++)
+                v = v * 10 + (*p - '0');
+            if (v >= 1)
+                cached = v;
+            free(e);
+        }
+    }
+    return cached;
+}
+
+/* The byte ceiling an endpoint puts on a base64 attachment. A file path cannot
+ * be re-encoded here (no inflate), so this and the pixel ceiling read by
+ * image_dims_of are all a guard can honestly know before spending a round on a
+ * request the endpoint would refuse. KK_IMG_MAX_BYTES below 1 KiB disables the
+ * byte guard. */
+static int64_t img_max_bytes(void)
+{
+    static int64_t cached;
+    static int read;
+    if (!read) {
+        read = 1;
+        cached = 8 << 20;
+        char *e = env_get("KK_IMG_MAX_BYTES");
         if (e) {
             int64_t v = 0;
             for (const char *p = e; *p >= '0' && *p <= '9'; p++)
@@ -6219,8 +6323,38 @@ static int attach_user_images(struct message *m, const char *text)
         if (!data)
             continue;
         /* magic bytes confirm what the extension claimed */
-        if (image_mime_of(ps, data, len)) {
-            struct image_part part = { xstrdup(mime), b64_encode(data, len) };
+        const char *real = image_mime_of(ps, data, len);
+        if (real) {
+            /* a file path cannot be decoded here (no inflate), so the guard
+             * refuses only what the endpoint refuses for certain: base64
+             * past the byte cap, or a dimension past the documented max.
+             * Anything smaller attaches as-is — the endpoint downscales it. */
+            int iw = 0, ih = 0;
+            int64_t maxb = img_max_bytes();
+            int over_bytes = maxb >= 1024
+                             && (int64_t)(len / 3 * 4 + 64) > maxb;
+            int over_dims = image_dims_of(data, len, real, &iw, &ih) == 0
+                            && (iw > 8000 || ih > 8000);
+            if (over_bytes || over_dims) {
+                if (over_dims)
+                    out_printf(vt_or("\x1b[33m⚠\x1b[0m 图片 %.*s 为 %dx%d，"
+                                     "超过端点 8000px 尺寸上限，未附带上传\r\n",
+                                     "⚠ 图片 %.*s 为 %dx%d，超过端点 8000px "
+                                     "尺寸上限，未附带上传\r\n"),
+                               (int)keep, path, iw, ih);
+                else
+                    out_printf(vt_or("\x1b[33m⚠\x1b[0m 图片 %.*s 约 %.1fMB，"
+                                     "base64 后超过 %lldMB 上限，未附带上传"
+                                     "（请先压缩或缩小）\r\n",
+                                     "⚠ 图片 %.*s 约 %.1fMB，base64 后超过 "
+                                     "%lldMB 上限，未附带上传（请先压缩或"
+                                     "缩小）\r\n"),
+                               (int)keep, path, (double)len / 1048576.0,
+                               (long long)(maxb / 1048576));
+                free(data);
+                continue;
+            }
+            struct image_part part = { xstrdup(real), b64_encode(data, len) };
             if (part.mime && part.b64) {
                 DA_PUSH(m->images, part);
                 attached++;
