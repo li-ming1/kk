@@ -16,7 +16,10 @@
  * frees on the streaming path); JSON parses to (ptr,len) slices into a buffer
  * the caller keeps alive; strdup only for what outlives the turn.
  *
- * Display == model view: nothing the model sees is hidden from the screen.
+ * Display: what the model sees reaches the screen, with one deliberate
+ * exception — the body a quiet tool (read, find, grep) returns stays in the
+ * model's view only, because 2000 lines of file would bury the conversation.
+ * Their errors are still shown, and the session log holds every byte sent.
  */
 
 /* Trim windows.h: console/process/thread/WinHTTP only — skipping GDI, crypto,
@@ -120,6 +123,28 @@ static char *env_get(const char *name)
         return NULL;
     }
     return v;
+}
+
+/* Decimal digits at *pp, advancing past them (an empty run parses to 0). */
+static int64_t str_to_i64(const char **pp)
+{
+    int64_t v = 0;
+    while (**pp >= '0' && **pp <= '9')
+        v = v * 10 + *(*pp)++ - '0';
+    return v;
+}
+
+/* Environment integer, or fallback when unset, unparsable, or below `min`.
+ * Callers that read it on a hot path keep their own cached static. */
+static int64_t env_i64(const char *name, int64_t min, int64_t fallback)
+{
+    char *raw = env_get(name);
+    if (!raw)
+        return fallback;
+    const char *p = raw; /* str_to_i64 advances its cursor: keep the block */
+    int64_t v = str_to_i64(&p);
+    free(raw);
+    return v >= min ? v : fallback;
 }
 
 static char *xasprintf(const char *fmt, ...)
@@ -372,6 +397,112 @@ static size_t ascii_run(const char *s, size_t n)
     while (i < n && (unsigned char)s[i] >= 0x20 && (unsigned char)s[i] < 0x80)
         i++;
     return i;
+}
+
+/* One vector pass over a freshly read buffer answers the three questions the
+ * read path used to ask three ways: how many lines it holds (a page that stops
+ * early still has to report the real length), whether every byte is ASCII
+ * (pure ASCII is valid UTF-8 by construction, so a negative here lets the
+ * caller skip MultiByteToWideChar's whole-file validation, which costs more
+ * than reading the file did), and whether a control byte appears in the first
+ * 8 KiB (the binary sniff).
+ *
+ * SSE2 has no unsigned byte compare, so `>= 0x80` is "negative when read
+ * signed" and `< 0x20` is a signed compare with that case removed. The line
+ * counter is 16 bytes wide and gains at most 4 per block, so it is drained
+ * into the scalar total every 32 blocks (128 < 256). */
+struct text_scan {
+    size_t lines;   /* '\n' count, plus one if the buffer ends mid-line */
+    int ascii;      /* every byte < 0x80 */
+    int control;    /* a byte < 0x20 that is not \t \n \r in the head window */
+};
+
+#define TEXT_SNIFF_HEAD 8000
+
+static struct text_scan scan_text(const char *s, size_t n)
+{
+    struct text_scan r = { 0, 1, 0 };
+    size_t i = 0, nl = 0;
+#if defined(_M_X64)
+    const __m128i cnl = _mm_set1_epi8('\n');
+    const __m128i c20 = _mm_set1_epi8(0x20);
+    const __m128i ctab = _mm_set1_epi8('\t');
+    const __m128i ccrlen = _mm_set1_epi8('\r');
+    const __m128i zero = _mm_setzero_si128();
+    __m128i acc = zero;
+    unsigned blocks = 0, ctrl = 0;
+    /* The head window first: the control-byte test costs six extra vector ops
+     * per lane, and paying that over a whole file to answer a question about
+     * its first 8 KiB is the difference between 0.03 and 0.10 ms on a
+     * 660 KB read. */
+    size_t head = n < TEXT_SNIFF_HEAD ? n : TEXT_SNIFF_HEAD;
+    for (; i + 16 <= head; i += 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+        __m128i high = _mm_cmplt_epi8(v, zero);
+        acc = _mm_sub_epi8(acc, _mm_cmpeq_epi8(v, cnl));
+        __m128i lo = _mm_andnot_si128(high, _mm_cmplt_epi8(v, c20));
+        __m128i ok = _mm_or_si128(_mm_cmpeq_epi8(v, ctab),
+                                  _mm_or_si128(_mm_cmpeq_epi8(v, cnl),
+                                               _mm_cmpeq_epi8(v, ccrlen)));
+        ctrl |= (unsigned)_mm_movemask_epi8(_mm_andnot_si128(ok, lo));
+        if (_mm_movemask_epi8(high))
+            r.ascii = 0;
+    }
+    { /* drain: the body loop counts 64-byte blocks, not lanes */
+        unsigned char l[16];
+        _mm_storeu_si128((__m128i *)l, acc);
+        for (int k = 0; k < 16; k++)
+            nl += l[k];
+        acc = zero;
+    }
+    for (; i < head; i++) {
+        unsigned char c = (unsigned char)s[i];
+        nl += c == '\n';
+        if (c >= 0x80)
+            r.ascii = 0;
+        if (c < 0x20 && c != '\t' && c != '\n' && c != '\r')
+            r.control = 1;
+    }
+    for (; i + 64 <= n; i += 64) {
+        __m128i hi = zero;
+        for (int k = 0; k < 4; k++) {
+            __m128i v = _mm_loadu_si128((const __m128i *)(s + i + 16 * k));
+            hi = _mm_or_si128(hi, _mm_cmplt_epi8(v, zero));
+            acc = _mm_sub_epi8(acc, _mm_cmpeq_epi8(v, cnl));
+        }
+        if (_mm_movemask_epi8(hi))
+            r.ascii = 0;
+        if (++blocks == 32) { /* at most 4 per counter byte: 128 < 256 */
+            unsigned char l[16];
+            _mm_storeu_si128((__m128i *)l, acc);
+            for (int k = 0; k < 16; k++)
+                nl += l[k];
+            acc = zero;
+            blocks = 0;
+        }
+    }
+    for (; i + 16 <= n; i += 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+        acc = _mm_sub_epi8(acc, _mm_cmpeq_epi8(v, cnl));
+        if (_mm_movemask_epi8(_mm_cmplt_epi8(v, zero)))
+            r.ascii = 0;
+    }
+    {
+        unsigned char l[16];
+        _mm_storeu_si128((__m128i *)l, acc);
+        for (int k = 0; k < 16; k++)
+            nl += l[k];
+    }
+    r.control |= ctrl != 0;
+#endif
+    for (; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        nl += c == '\n';
+        if (c >= 0x80)
+            r.ascii = 0;
+    }
+    r.lines = nl + (n && s[n - 1] != '\n' ? 1 : 0);
+    return r;
 }
 
 /* --- dyn arrays ------------------------------------------------------- */
@@ -1217,6 +1348,17 @@ static size_t u8_prev(const char *s, size_t i)
     return j;
 }
 
+/* The largest cut position <= i that does not split a codepoint: a byte at the
+ * cut that is a continuation means its sequence started earlier. (u8_prev
+ * answers the other question — where the codepoint ending at or before i-1
+ * begins.) Display caps that must not print half a glyph all need this one. */
+static size_t u8_floor(const char *s, size_t i)
+{
+    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80)
+        i--;
+    return i;
+}
+
 static size_t u8_next(const char *s, size_t n, size_t i)
 {
     if (i >= n)
@@ -1381,9 +1523,10 @@ static void term_init(void)
 
 /* Input is read as the terminal's raw VT byte stream (ReadFile +
  * ENABLE_VIRTUAL_TERMINAL_INPUT), never as INPUT_RECORDs: conhost's key
- * translator mangles bracketed-paste markers and Alt chords. Three consumers
- * share the byte layer — composer editor, turn-time input reader, session
- * picker — each bracketed by term_raw_begin/term_raw_end (never overlapping).
+ * translator mangles bracketed-paste markers and Alt chords. Two consumers
+ * share the byte layer — the composer (edit_line, which also reads during a
+ * turn) and the session picker — each bracketed by term_raw_begin/term_raw_end,
+ * never overlapping.
  */
 #define VT_INPUT_FLAG 0x0200 /* ENABLE_VIRTUAL_TERMINAL_INPUT */
 
@@ -2112,7 +2255,7 @@ static int http_post_stream(const char *url, const char *auth_key,
     }
 
     int result = 0;
-    wchar_t *whost = NULL, *wpath = NULL, *whdrs = NULL;
+    wchar_t *wpath = NULL, *whdrs = NULL;
     HINTERNET request = NULL;
     char *resp_all = NULL;
     size_t resp_len = 0, resp_cap = 0;
@@ -2122,11 +2265,14 @@ static int http_post_stream(const char *url, const char *auth_key,
         *body_out = xstrdup("WinHttpOpen failed");
         goto out;
     }
-    /* the host's wide form is a UTF-8 probe and nothing more: WinHttpConnect
-     * widens the host itself, against the connection handle it caches */
-    whost = w_from_utf8(host);
+    /* The host needs no wide copy of its own: WinHttpConnect widens it again,
+     * against the connection handle it caches. Asking the converter for the
+     * size answers the only question we have here — is this valid UTF-8 —
+     * without an allocation and a conversion on every request. */
+    int host_ok = MultiByteToWideChar(CP_UTF8, 0, host, (int)strlen(host),
+                                      NULL, 0) > 0;
     wpath = w_from_utf8(path);
-    if (!whost || !wpath) {
+    if (!host_ok || !wpath) {
         /* xmalloc fatals on real exhaustion, so NULL here only ever means
          * the bytes were not valid UTF-8 */
         *body_out = xstrdup("base_url is not valid UTF-8");
@@ -2265,7 +2411,6 @@ out:
     /* session and pooled connection stay cached for the next request */
     free(whdrs);
     free(wpath);
-    free(whost);
     free(host);
     free(path);
     return result;
@@ -2305,13 +2450,13 @@ struct inline_state {
 };
 
 /* Compose one SGR sequence for a style set; the channel's base flags are
- * re-applied after the reset. seq must hold >=56 bytes. Built byte by byte:
- * the printf round-trip ran on every style toggle. */
-static void compose_sgr(char *seq, size_t cap, const char *base_flags,
+ * re-applied after the reset. seq must hold >=56 bytes, which is what both
+ * callers declare. Built byte by byte: the printf round-trip ran on every
+ * style toggle. */
+static void compose_sgr(char *seq, const char *base_flags,
                         const struct inline_state *st)
 {
     size_t n = 0;
-    (void)cap;
     seq[n++] = '\x1b';
     seq[n++] = '[';
     seq[n++] = '0';
@@ -2406,7 +2551,7 @@ static void painter_emit_sgr(struct painter *p, struct buf *sink)
         return; /* style already open in the pending buffer: hot path */
     p->have_sgr = 1;
     char seq[56];
-    compose_sgr(seq, sizeof seq, p->base_flags, p->live);
+    compose_sgr(seq, p->base_flags, p->live);
     buf_appends(sink, seq);
 }
 
@@ -2414,9 +2559,10 @@ static void painter_start_row(struct painter *p)
 {
     /* a resize mid-stream: the composer keeps polling the size, so wrap at
      * the new width from this row on. Committed rows keep their old wrap —
-     * the console reflows its own buffer on resize anyway. */
+     * the console reflows its own buffer on resize anyway. Only the width is
+     * set here: painter_layout runs once, on the line below. */
     if (p->cols != g_term_cols)
-        painter_set_width(p, g_term_cols);
+        p->cols = g_term_cols;
     painter_layout(p);
     p->row_open = 1;
     p->row_shown = 0;
@@ -3143,7 +3289,7 @@ static void tbl_cell_sgr(struct buf *out, const struct inline_state *st,
     if (!g_emit_vt)
         return;
     char seq[56];
-    compose_sgr(seq, sizeof seq, "", st);
+    compose_sgr(seq, "", st);
     if (!*have || strcmp(seq, last) != 0) {
         buf_appends(out, seq);
         memcpy(last, seq, strlen(seq) + 1); /* last is the caller's char[56] */
@@ -4637,6 +4783,17 @@ static void stream_apply_hit(struct stream_state *st,
         stream_apply_call(st, &h->calls[k]);
 }
 
+/* The delta reader: a zero-allocation scan, with the DOM as fallback for
+ * anything the scan is not certain about. tmp/bench.c builds with
+ * KK_TEST_SEAMS and flips the switch to push every event down both paths and
+ * compare the assembly; shipping builds get neither the global nor the test. */
+#ifdef KK_TEST_SEAMS
+static int g_delta_fast_off;
+#define DELTA_SCAN(p, n, h) (!g_delta_fast_off && delta_fast_scan((p), (n), (h)))
+#else
+#define DELTA_SCAN(p, n, h) delta_fast_scan((p), (n), (h))
+#endif
+
 /* One SSE data payload: parse and fold into state + hooks. Decoded deltas
  * go straight into their owning buffers — the hooks render from the
  * appended range, so no scratch copy per delta is needed. */
@@ -4652,7 +4809,7 @@ static void stream_handle_data(struct str data, void *user)
     }
 
     struct delta_hit dh;
-    if (delta_fast_scan(data.p, data.n, &dh)) {
+    if (DELTA_SCAN(data.p, data.n, &dh)) {
         stream_apply_hit(st, &cr->hooks, &dh);
         return;
     }
@@ -4822,7 +4979,7 @@ static int sse_on_bytes(const char *bytes, size_t n, void *user)
 }
 
 /* ==========================================================================
- * 7. tools — read / write / edit / bash
+ * 7. tools — read / write / bash / find / grep
  * ========================================================================== */
 
 /* --- conversation (provider-shaped but provider-independent at heart) -- */
@@ -5607,6 +5764,29 @@ static int blank_line(const char *s, size_t llen)
 static void buf_append_line_capped_pfx(struct buf *out, const char *pre,
                                        size_t pn, const char *s, size_t n)
 {
+    /* The ordinary line — printable ASCII, short enough to fit whole — is
+     * what source code and logs are made of: one reservation, two memcpys, no
+     * per-codepoint decode and no NUL write per run. A trailing CR rides
+     * through with the width of 1 the general path would have given it. */
+    size_t body = n;
+    int cr = body && s[body - 1] == '\r';
+    if (cr)
+        body--;
+    if (body + (cr ? 1u : 0u) <= (size_t)KK_LINE_COLS
+        && ascii_run(s, body) == body) {
+        buf_reserve(out, pn + body + 2);
+        if (pn) {
+            memcpy(out->p + out->len, pre, pn);
+            out->len += pn;
+        }
+        memcpy(out->p + out->len, s, body);
+        out->len += body;
+        if (cr)
+            out->p[out->len++] = '\r';
+        out->p[out->len++] = '\n';
+        out->p[out->len] = '\0';
+        return;
+    }
     buf_reserve(out, pn + n + 24);
     if (pn) {
         memcpy(out->p + out->len, pre, pn);
@@ -5971,56 +6151,6 @@ static int image_dims_of(const char *data, size_t len, const char *mime,
     return -1;
 }
 
-/* Long-edge cap for attached images. Vision endpoints downscale anything
- * past ~1568px themselves AND refuse base64 bodies over 5-10MB, so a 4K
- * screenshot used to encode to a ~25MB PNG (a ~33MB request: rejected, or
- * 2-3x the tokens a 1568px render costs). Pay the pixels once, here, at
- * bilinear quality. KK_IMG_MAX_EDGE below 64 disables the cap. */
-static int64_t img_max_edge(void)
-{
-    static int64_t cached;
-    static int read;
-    if (!read) {
-        read = 1;
-        cached = 1568;
-        char *e = env_get("KK_IMG_MAX_EDGE");
-        if (e) {
-            int64_t v = 0;
-            for (const char *p = e; *p >= '0' && *p <= '9'; p++)
-                v = v * 10 + (*p - '0');
-            if (v >= 1)
-                cached = v;
-            free(e);
-        }
-    }
-    return cached;
-}
-
-/* The byte ceiling an endpoint puts on a base64 attachment. A file path cannot
- * be re-encoded here (no inflate), so this and the pixel ceiling read by
- * image_dims_of are all a guard can honestly know before spending a round on a
- * request the endpoint would refuse. KK_IMG_MAX_BYTES below 1 KiB disables the
- * byte guard. */
-static int64_t img_max_bytes(void)
-{
-    static int64_t cached;
-    static int read;
-    if (!read) {
-        read = 1;
-        cached = 8 << 20;
-        char *e = env_get("KK_IMG_MAX_BYTES");
-        if (e) {
-            int64_t v = 0;
-            for (const char *p = e; *p >= '0' && *p <= '9'; p++)
-                v = v * 10 + (*p - '0');
-            if (v >= 1)
-                cached = v;
-            free(e);
-        }
-    }
-    return cached;
-}
-
 /* Decode a clipboard DIB into 8-bit RGB PNG bytes (heap, *out_len set),
  * or NULL when the format is one this does not handle. */
 static unsigned char *dib_to_png(const unsigned char *dib, size_t dib_len,
@@ -6098,7 +6228,11 @@ static unsigned char *dib_to_png(const unsigned char *dib, size_t dib_len,
 
     /* 2. downscale to the cap, bilinear, preserving aspect ratio. Center
      * sampling keeps the mapping unbiased; edges clamp instead of wrapping. */
-    int64_t cap = img_max_edge();
+    /* Long-edge cap: vision endpoints downscale past ~1568px themselves and
+     * refuse base64 bodies over 5-10MB, so a 4K screenshot used to encode to a
+     * ~25MB PNG (a ~33MB request: rejected, or 2-3x the tokens a 1568px render
+     * costs). Pay the pixels once, here, at bilinear quality. */
+    int64_t cap = env_i64("KK_IMG_MAX_EDGE", 1, 1568);
     int64_t long_edge = (int64_t)w > (int64_t)height ? w : (int64_t)height;
     if (cap >= 64 && long_edge > cap) {
         double f = (double)cap / (double)long_edge;
@@ -6330,7 +6464,10 @@ static int attach_user_images(struct message *m, const char *text)
              * past the byte cap, or a dimension past the documented max.
              * Anything smaller attaches as-is — the endpoint downscales it. */
             int iw = 0, ih = 0;
-            int64_t maxb = img_max_bytes();
+            /* a file path cannot be re-encoded here (no inflate), so refuse
+             * only what the endpoint refuses for certain, and say so before
+             * spending a round on a guaranteed rejection */
+            int64_t maxb = env_i64("KK_IMG_MAX_BYTES", 1, 8 << 20);
             int over_bytes = maxb >= 1024
                              && (int64_t)(len / 3 * 4 + 64) > maxb;
             int over_dims = image_dims_of(data, len, real, &iw, &ih) == 0
@@ -6417,6 +6554,33 @@ static size_t read_line_prefix(char *dst, size_t line_no)
     return o;
 }
 
+/* Format lines offset..offset+limit of one buffer, numbering as it goes. Its
+ * own function because the per-line work is three calls, and inside the big
+ * tool_read they do not all inline: the same loop measured in a small function
+ * ran at half the cost. */
+static void read_page(struct buf *out, const char *data, size_t len,
+                      size_t offset, size_t limit, size_t *emitted_out,
+                      size_t *last_out)
+{
+    size_t line_no = 0, emitted = 0, last = 0;
+    const char *p = data, *end = data + len;
+    while (p < end && emitted < limit) {
+        line_no++;
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t llen = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        if (line_no >= offset) {
+            char pre[28];
+            size_t pn = read_line_prefix(pre, line_no);
+            buf_append_line_capped_pfx(out, pre, pn, p, llen);
+            emitted++;
+            last = line_no;
+        }
+        p = nl ? nl + 1 : end;
+    }
+    *emitted_out = emitted;
+    *last_out = last;
+}
+
 /* Read a whole file and answer, from the same open, whether somebody else is
  * holding it. dwShareMode 0 *is* the lock test: if the open succeeds nobody
  * else has the file, and ERROR_SHARING_VIOLATION means they do — so the read
@@ -6486,47 +6650,38 @@ static char *tool_read(const struct jnode *args, struct tool_img *img)
         result = buf_detach(&out);
         goto cleanup;
     }
-    /* binary sniff: NUL or dense control bytes never belong in the context */
-    size_t probe = len < 8000 ? len : 8000;
-    int binary = memchr(data, 0, probe) != NULL;
-    for (size_t k = 0; k < probe && !binary; k++)
-        if ((unsigned char)data[k] < 0x20 && data[k] != '\t' && data[k] != '\n'
-            && data[k] != '\r')
-            binary = 1;
-    if (binary) {
+    /* One vector pass answers all three: is this binary, can a transcode even
+     * be needed, and how many lines the file has. */
+    struct text_scan ts = scan_text(data, len);
+    if (ts.control) {
         result = xasprintf("error: '%.*s' is a binary file (%zu bytes); "
                            "use bash to inspect it", (int)path.n, path.p, len);
         goto cleanup;
     }
     /* invalid UTF-8: assume the console codepage (GBK on zh-CN) and
-     * transcode so the model sees real text */
-    transcode_to_utf8(&data, &len);
-    /* walk to EOF even after the limit: the model is told the file's
-     * full line count instead of being left to guess */
-    size_t line_no = 0, emitted = 0, last = 0;
-    const char *p = data, *end = data + len;
-    while (p < end) {
-        line_no++;
-        const char *nl = mem_find(p, (size_t)(end - p), "\n", 1);
-        size_t llen = nl ? (size_t)(nl - p) : (size_t)(end - p);
-        if (line_no >= (size_t)offset && emitted < (size_t)limit) {
-            char pre[28];
-            size_t pn = read_line_prefix(pre, line_no);
-            buf_append_line_capped_pfx(&out, pre, pn, p, llen);
-            emitted++;
-            last = line_no;
-        }
-        p = nl ? nl + 1 : end;
+     * transcode so the model sees real text. Pure ASCII is valid UTF-8 by
+     * construction, so the scan's answer skips the OS validator outright —
+     * over a several-hundred-KB file it cost more than the read. */
+    if (!ts.ascii) {
+        size_t before = len;
+        transcode_to_utf8(&data, &len);
+        if (len != before)
+            ts = scan_text(data, len); /* the bytes were rewritten: recount */
     }
-    if (line_no == 0)
+    /* Lines past the page are never formatted but are still counted, from the
+     * scan: the model is told the file's full line count instead of being left
+     * to guess, without a second walk over the bytes it will not see. */
+    size_t emitted = 0, last = 0;
+    read_page(&out, data, len, (size_t)offset, (size_t)limit, &emitted, &last);
+    if (ts.lines == 0)
         buf_appends(&out, "(empty file)\n");
     else if (emitted == 0)
         buf_appendf(&out, "[offset %zu is beyond end of file: %zu lines]\n",
-                    (size_t)offset, line_no);
-    else if (emitted == (size_t)limit && last < line_no)
+                    (size_t)offset, ts.lines);
+    else if (emitted == (size_t)limit && last < ts.lines)
         buf_appendf(&out, "[showing lines %zu-%zu of %zu; "
                           "continue with offset %zu]\n",
-                    (size_t)offset, last, line_no, last + 1);
+                    (size_t)offset, last, ts.lines, last + 1);
     result = buf_detach(&out);
 
 cleanup:
@@ -6712,6 +6867,13 @@ cleanup:
 /* --- bash ---------------------------------------------------------------- */
 
 /* Base64 (for PowerShell -EncodedCommand). Returns heap string. */
+/* Output length of b64_encode for n input bytes — the encoder's own rule, so
+ * a caller that needs the size never re-scans the payload to count it. */
+static size_t b64_out_len(size_t n)
+{
+    return ((n + 2) / 3) * 4;
+}
+
 static char *b64_encode(const char *data, size_t n)
 {
     /* 12-bit lookup: two output characters per entry, so a full 3-byte
@@ -6727,7 +6889,7 @@ static char *b64_encode(const char *data, size_t n)
                 | ((uint32_t)(unsigned char)tbl[v & 63] << 8);
         lut_ready = 1;
     }
-    size_t out_n = ((n + 2) / 3) * 4;
+    size_t out_n = b64_out_len(n);
     char *out = xmalloc(out_n + 1);
     size_t o = 0, i = 0;
     for (; i + 3 <= n; i += 3) {
@@ -7079,13 +7241,16 @@ static int shell_run(struct str command,
         buf_appendc(&line, '\n');
         buf_append_n(&line, command.p, command.n);
         char *b64 = b64_encode(line.p, line.len);
+        /* The wire is the base64 plus its CRLF, and the encoder's own rule
+         * says how long that is: no re-scan of a command line that can run to
+         * 160 KB on the way into the shell. */
+        size_t wire_n = b64_out_len(line.len) + 2;
         buf_free(&line);
         char *wire = xasprintf("%s\r\n", b64);
         free(b64);
 
         DWORD wrote = 0;
-        int sent = WriteFile(g_ps_stdin_w, wire, (DWORD)strlen(wire), &wrote,
-                             NULL);
+        int sent = WriteFile(g_ps_stdin_w, wire, (DWORD)wire_n, &wrote, NULL);
         free(wire);
         if (!sent) {
             /* the session died since the last call; respawn and resend */
@@ -7421,21 +7586,10 @@ static void dirs_init(void)
 /* Read key=value lines. '#' starts a comment. Values may contain '='. */
 static void config_read_file(struct config *cfg, const char *path)
 {
-    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE)
+    size_t n = 0;
+    char *text = file_read_all(str_from_c(path), &n);
+    if (!text)
         return;
-    LARGE_INTEGER sz;
-    char *text = NULL;
-    if (!GetFileSizeEx(f, &sz) || sz.QuadPart > 1024 * 1024)
-        goto out;
-    size_t n = (size_t)sz.QuadPart;
-    text = xmalloc(n + 1);
-    DWORD got = 0;
-    ReadFile(f, text, (DWORD)n, &got, NULL);
-    text[got] = '\0';
-    CloseHandle(f);
-    f = INVALID_HANDLE_VALUE;
 
     char *line = text;
     while (line && *line) {
@@ -7472,9 +7626,6 @@ static void config_read_file(struct config *cfg, const char *path)
         line = nl ? nl + 1 : NULL;
     }
     free(text);
-out:
-    if (f != INVALID_HANDLE_VALUE)
-        CloseHandle(f);
 }
 
 static void config_load(struct config *cfg)
@@ -7507,8 +7658,6 @@ static void config_load(struct config *cfg)
         }
     }
 }
-
-/* --- bash ---------------------------------------------------------------- */
 
 static void config_free(struct config *cfg)
 {
@@ -7546,13 +7695,7 @@ static void session_flush(struct session_log *sl)
 static void session_point_current(const char *path)
 {
     char *cur = xasprintf("%s\\current", g_localapp_dir);
-    HANDLE cf = CreateFileA(cur, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, NULL);
-    if (cf != INVALID_HANDLE_VALUE) {
-        DWORD wrote = 0;
-        WriteFile(cf, path, (DWORD)strlen(path), &wrote, NULL);
-        CloseHandle(cf);
-    }
+    file_write_all(str_from_c(cur), path, strlen(path));
     free(cur);
 }
 
@@ -7968,8 +8111,7 @@ static void sess_scan_file(struct sess_row *row)
                             size_t take = i < sizeof row->preview - 1
                                               ? i
                                               : sizeof row->preview - 1;
-                            while (take > 0 && (b.p[take] & 0xC0) == 0x80)
-                                take--;
+                            take = u8_floor(b.p, take);
                             memcpy(row->preview, b.p, take);
                             row->preview[take] = '\0';
                             buf_free(&b);
@@ -8130,10 +8272,40 @@ static char *load_agents_md(void)
 
 #define SKILL_ROOT_MAX  2
 #define SKILL_MAX       32
-#define SKILL_DESC_MAX  600  /* these descriptions are written for routing;
-                              * cutting them short costs the "use when" half */
+#define SKILL_DESC_MAX  240  /* what a skill is + when to use it fits in the
+                              * leading sentences; the rest of these fields is
+                              * enumerated trigger phrasings, and every byte of
+                              * the index is re-sent on every round */
 #define SKILL_HEAD_MAX  16384 /* only the frontmatter is ever looked at */
 #define SKILL_INDEX_MAX 12288
+
+/* Where a skill description ends once it is over the ceiling: at the last
+ * sentence boundary inside it, because the routing half ("Use when ...") is
+ * what must survive; failing that at a word boundary, never inside a UTF-8
+ * sequence. A CJK full stop is 0xE3 0x80 0x82. */
+static size_t skill_desc_cut(const char *d, size_t ceiling)
+{
+    size_t cut = u8_floor(d, ceiling);
+    size_t sent = 0;
+    for (size_t k = 1; k < cut; k++) {
+        char c = d[k];
+        int stop = (c == '.' || c == '!' || c == '?' || c == ';')
+                   && (k + 1 >= cut || d[k + 1] == ' ' || d[k + 1] == '\n');
+        if (!stop && (unsigned char)c == 0xE3 && k + 2 < cut
+            && (unsigned char)d[k + 1] == 0x80
+            && (unsigned char)d[k + 2] == 0x82)
+            stop = 1;
+        if (stop)
+            sent = k + 1; /* keep the mark with the sentence */
+    }
+    if (sent >= cut / 2)
+        return sent;
+    size_t floor_at = cut > 40 ? cut - 40 : 0;
+    size_t w = cut;
+    while (w > floor_at && d[w] != ' ')
+        w--;
+    return w > floor_at ? w : cut;
+}
 
 /* Collapse a byte run into single-spaced text: YAML folds block scalars
  * across indented lines, and the index wants one line per skill. */
@@ -8247,17 +8419,8 @@ static void skill_describe(const char *dir, const char *dname, struct buf *out,
     size_t dlen = desc ? strlen(desc) : 0;
     int clipped = 0;
     if (dlen > SKILL_DESC_MAX) {
-        size_t cut = SKILL_DESC_MAX;
-        while (cut > 0 && (desc[cut] & 0xC0) == 0x80)
-            cut--; /* never split a UTF-8 sequence */
-        size_t floor_at = cut > 40 ? cut - 40 : 0;
-        size_t w = cut;
-        while (w > floor_at && desc[w] != ' ')
-            w--;
-        if (w > floor_at)
-            cut = w; /* end on a word, not mid-token */
-        desc[cut] = '\0';
-        dlen = cut;
+        dlen = skill_desc_cut(desc, SKILL_DESC_MAX);
+        desc[dlen] = '\0';
         clipped = 1;
     }
     size_t need = strlen(name) + dlen + strlen(path) + 16;
@@ -10306,38 +10469,6 @@ static char *api_error_message(const char *body)
     return out;
 }
 
-/* Decimal digits at *pp, advancing past them (an empty run parses to 0). */
-static int64_t str_to_i64(const char **pp)
-{
-    int64_t v = 0;
-    while (**pp >= '0' && **pp <= '9')
-        v = v * 10 + *(*pp)++ - '0';
-    return v;
-}
-
-/* Hard ceiling on what one response may generate. Without it a degenerate
- * repetition loop bills unbounded output and then sits in the session log
- * forever: one captured run put 757,988 characters (~190k tokens, 98% of it
- * the same sentence repeated) into a single assistant message. The default
- * keeps ~3x headroom over writing a 40KB file, whose content also counts as
- * output. */
-static int64_t max_output_tokens(void)
-{
-    static int64_t cached;
-    static int read;
-    if (!read) {
-        read = 1;
-        cached = 32768;
-        const char *e = env_get("KK_MAX_OUTPUT_TOKENS");
-        if (e) {
-            int64_t v = str_to_i64(&e);
-            if (v >= 1)
-                cached = v;
-        }
-    }
-    return cached;
-}
-
 /* The serialized `tools` array: a compile-time constant, escaped once. Also
  * read by the startup head report — every round pays this bytes-per-request. */
 static const struct buf *tools_json_block(void)
@@ -10414,7 +10545,13 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
     buf_appendf(&body,
                 "],\"stream\":true,\"max_tokens\":%lld,"
                 "\"stream_options\":{\"include_usage\":true}}",
-                (long long)max_output_tokens());
+                /* Without a ceiling a degenerate repetition loop bills
+                 * unbounded output and then sits in the session log forever:
+                 * one captured run put 757,988 characters (~190k tokens, 98%
+                 * the same sentence) into one assistant message. The default
+                 * keeps ~3x headroom over writing a 40KB file, whose content
+                 * also counts as output. */
+                (long long)env_i64("KK_MAX_OUTPUT_TOKENS", 1, 32768));
 
     struct chat_request cr;
     memset(&cr, 0, sizeof cr);
@@ -10454,15 +10591,8 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
             dumped_probe = 1;
             dump_path = env_get("KK_DUMP_REQ");
         }
-        if (dump_path && *dump_path) {
-            HANDLE h = CreateFileA(dump_path, GENERIC_WRITE, 0, NULL,
-                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (h != INVALID_HANDLE_VALUE) {
-                DWORD wr;
-                WriteFile(h, body.p, (DWORD)body.len, &wr, NULL);
-                CloseHandle(h);
-            }
-        }
+        if (dump_path && *dump_path)
+            file_write_all(str_from_c(dump_path), body.p, body.len);
     }
     /* prefix-cache diagnostics: how much of this request repeats the
      * previous one byte-for-byte from the very first byte. A small `shared`
@@ -10556,15 +10686,8 @@ static int64_t g_window_tokens;
 
 static int64_t compact_window_tokens(void)
 {
-    if (!g_window_tokens) {
-        g_window_tokens = 262144;
-        const char *e = env_get("KK_CONTEXT_WINDOW");
-        if (e) {
-            int64_t v = str_to_i64(&e);
-            if (v >= 1)
-                g_window_tokens = v;
-        }
-    }
+    if (!g_window_tokens)
+        g_window_tokens = env_i64("KK_CONTEXT_WINDOW", 1, 262144);
     return g_window_tokens;
 }
 
@@ -11409,26 +11532,16 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
 #define GOAL_DONE_MARK "\xE2\x9C\x85"                          /* ✅ */
 #define GOAL_TAG       "\xE7\x9B\xAE\xE6\xA0\x87\xE6\xA8\xA1\xE5\xBC\x8F" /* 目标模式 */
 
-/* Env-tunable budget reader; a goal is a large task by definition, so the
- * defaults are generous. A missing or absurd value falls back. */
-static int64_t goal_budget(const char *name, int64_t fallback)
-{
-    char *e = env_get(name);
-    if (!e)
-        return fallback;
-    const char *p = e; /* str_to_i64 advances its cursor: keep the block */
-    int64_t v = str_to_i64(&p);
-    free(e);
-    return v >= 1 ? v : fallback;
-}
 
 static int goal_loop(struct config *cfg, struct conversation *cv,
                      struct session_log *slog, const char *system_prompt,
                      const char *task)
 {
-    int64_t max_rounds = goal_budget("KK_GOAL_ROUNDS", 50);
-    int64_t max_minutes = goal_budget("KK_GOAL_MINUTES", 60);
-    int64_t max_tokens = goal_budget("KK_GOAL_TOKENS", 5000000);
+    /* Budgets are env-tunable; a goal is a large task by definition, so the
+     * defaults are generous and a missing or absurd value falls back. */
+    int64_t max_rounds = env_i64("KK_GOAL_ROUNDS", 1, 50);
+    int64_t max_minutes = env_i64("KK_GOAL_MINUTES", 1, 60);
+    int64_t max_tokens = env_i64("KK_GOAL_TOKENS", 1, 5000000);
     DWORD t0 = GetTickCount();
     int64_t spent = 0;
 

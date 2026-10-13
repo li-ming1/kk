@@ -87,8 +87,10 @@ Beyond the tools, the system prompt carries three things you control:
 - **`AGENTS.md`** files found from the working directory upward, parent-first.
 - **A skill index**: every `<workspace>\.agents\skills\<name>\SKILL.md` and
   `%USERPROFILE%\.agents\skills\...` (the workspace shadows a user-level name).
-  Only the name and description go into the prompt; the model `read`s the body
-  when a task matches. `/skills` prints exactly what the model was offered.
+  Only the name and the leading sentences of the description — at most 240
+  bytes, cut at a sentence end — go into the prompt, because every byte of the
+  index is re-sent on every round; the model `read`s the body when a task
+  matches. `/skills` prints exactly what the model was offered.
 - **A workspace snapshot**: the most-touched files with sizes and git status, so
   the first round is not spent discovering the directory.
 
