@@ -1854,8 +1854,7 @@ static void user_bars_buf(struct buf *out, const char *text, size_t len)
             }
         }
         buf_append_n(out, text + rs, i - rs);
-        for (size_t p = w; p < wrap; p++)
-            buf_appendc(out, ' ');
+        buf_append_spaces(out, wrap - w);
         buf_appends(out, "\x1b[0m\r\n\x1b[48;2;36;66;80m");
         if (text[i] == '\n')
             i++;
@@ -1863,8 +1862,7 @@ static void user_bars_buf(struct buf *out, const char *text, size_t len)
         w = 0;
     }
     buf_append_n(out, text + rs, len - rs);
-    for (size_t p = w; p < wrap; p++)
-        buf_appendc(out, ' ');
+    buf_append_spaces(out, wrap - w);
     buf_appends(out, "\x1b[0m");
 }
 
@@ -5894,6 +5892,31 @@ static uint32_t png_adler32(const unsigned char *data, size_t n)
     return (b << 16) | a;
 }
 
+/* Long-edge cap for attached images. Vision endpoints downscale anything
+ * past ~1568px themselves AND refuse base64 bodies over 5-10MB, so a 4K
+ * screenshot used to encode to a ~25MB PNG (a ~33MB request: rejected, or
+ * 2-3x the tokens a 1568px render costs). Pay the pixels once, here, at
+ * bilinear quality. KK_IMG_MAX_EDGE below 64 disables the cap. */
+static int64_t img_max_edge(void)
+{
+    static int64_t cached;
+    static int read;
+    if (!read) {
+        read = 1;
+        cached = 1568;
+        char *e = env_get("KK_IMG_MAX_EDGE");
+        if (e) {
+            int64_t v = 0;
+            for (const char *p = e; *p >= '0' && *p <= '9'; p++)
+                v = v * 10 + (*p - '0');
+            if (v >= 1)
+                cached = v;
+            free(e);
+        }
+    }
+    return cached;
+}
+
 /* Decode a clipboard DIB into 8-bit RGB PNG bytes (heap, *out_len set),
  * or NULL when the format is one this does not handle. */
 static unsigned char *dib_to_png(const unsigned char *dib, size_t dib_len,
@@ -5949,16 +5972,16 @@ static unsigned char *dib_to_png(const unsigned char *dib, size_t dib_len,
     if (pixel_off + stride * height > dib_len)
         return NULL;
 
-    /* raw scanlines: filter byte 0 per row, then RGB triplets */
-    size_t raw_len = height * (1 + row_bytes);
-    unsigned char *raw = xmalloc(raw_len);
+    /* 1. DIB pixels -> tightly packed RGB, top-down (the flip for bottom-up
+     * DIBs happens here, once). The 4th byte is read even at 24bpp: the
+     * masks decide which bits matter and BI_BITFIELDS uses all of them. */
+    unsigned char *rgb = xmalloc((size_t)w * height * 3);
     for (size_t row = 0; row < height; row++) {
         const unsigned char *line = dib + pixel_off
             + (size_t)(top_down ? row : height - 1 - row) * stride;
-        unsigned char *out = raw + row * (1 + row_bytes);
-        *out++ = 0; /* filter: none */
-        for (size_t x = 0; x < row_bytes; x += 3, out += 3) {
-            size_t px = x / 3 * (bpp / 8);
+        unsigned char *out = rgb + row * (size_t)w * 3;
+        for (size_t x = 0; x < (size_t)w; x++, out += 3) {
+            size_t px = x * (bpp / 8);
             uint32_t v = (uint32_t)line[px]
                 | ((uint32_t)line[px + 1] << 8)
                 | ((uint32_t)line[px + 2] << 16)
@@ -5968,6 +5991,78 @@ static unsigned char *dib_to_png(const unsigned char *dib, size_t dib_len,
             out[2] = (unsigned char)(v >> bsh);
         }
     }
+
+    /* 2. downscale to the cap, bilinear, preserving aspect ratio. Center
+     * sampling keeps the mapping unbiased; edges clamp instead of wrapping. */
+    int64_t cap = img_max_edge();
+    int64_t long_edge = (int64_t)w > (int64_t)height ? w : (int64_t)height;
+    if (cap >= 64 && long_edge > cap) {
+        double f = (double)cap / (double)long_edge;
+        size_t sw = (size_t)((double)w * f + 0.5);
+        size_t sh = (size_t)((double)height * f + 0.5);
+        if (sw < 1)
+            sw = 1;
+        if (sh < 1)
+            sh = 1;
+        unsigned char *small = xmalloc(sw * sh * 3);
+        for (size_t y = 0; y < sh; y++) {
+            double sy = ((double)y + 0.5) * (double)height / (double)sh - 0.5;
+            size_t y0;
+            double fy;
+            if (sy <= 0.0) {
+                y0 = 0;
+                fy = 0.0;
+            } else {
+                y0 = (size_t)sy;
+                if (y0 >= height)
+                    y0 = height - 1;
+                fy = sy - (double)y0;
+            }
+            size_t y1 = y0 + 1 < height ? y0 + 1 : y0;
+            for (size_t x = 0; x < sw; x++) {
+                double sx = ((double)x + 0.5) * (double)w / (double)sw - 0.5;
+                size_t x0;
+                double fx;
+                if (sx <= 0.0) {
+                    x0 = 0;
+                    fx = 0.0;
+                } else {
+                    x0 = (size_t)sx;
+                    if (x0 >= (size_t)w)
+                        x0 = (size_t)w - 1;
+                    fx = sx - (double)x0;
+                }
+                size_t x1 = x0 + 1 < (size_t)w ? x0 + 1 : x0;
+                const unsigned char *p00 = rgb + (y0 * (size_t)w + x0) * 3;
+                const unsigned char *p01 = rgb + (y0 * (size_t)w + x1) * 3;
+                const unsigned char *p10 = rgb + (y1 * (size_t)w + x0) * 3;
+                const unsigned char *p11 = rgb + (y1 * (size_t)w + x1) * 3;
+                unsigned char *o = small + (y * sw + x) * 3;
+                for (int c = 0; c < 3; c++) {
+                    double top = (double)p00[c] * (1.0 - fx)
+                               + (double)p01[c] * fx;
+                    double bot = (double)p10[c] * (1.0 - fx)
+                               + (double)p11[c] * fx;
+                    o[c] = (unsigned char)(top * (1.0 - fy) + bot * fy + 0.5);
+                }
+            }
+        }
+        free(rgb);
+        rgb = small;
+        w = (int)sw;
+        height = sh;
+    }
+
+    /* 3. PNG scanlines: filter byte 0 per row, then RGB triplets */
+    row_bytes = (size_t)w * 3;
+    size_t raw_len = height * (1 + row_bytes);
+    unsigned char *raw = xmalloc(raw_len);
+    for (size_t row = 0; row < height; row++) {
+        unsigned char *out = raw + row * (1 + row_bytes);
+        *out++ = 0; /* filter: none */
+        memcpy(out, rgb + row * row_bytes, row_bytes);
+    }
+    free(rgb);
 
     /* zlib stream: 78 01 + stored deflate blocks over raw + adler32 */
     size_t blocks = (raw_len + 65534) / 65535;
@@ -6309,6 +6404,24 @@ cleanup:
 
 /* --- write --------------------------------------------------------------- */
 
+/* The diff echo exists so the model can confirm the replacement landed —
+ * it is NOT content delivery: a 100KB file rewrite would otherwise ship
+ * ~25k tokens of text the model generated itself straight back to it as
+ * the tool result. Small edits (the norm) print whole; big ones show the
+ * head and the size, and the file is one read away. */
+#define DIFF_ECHO_MAX 500
+static void append_diff_side(struct buf *msg, char sign, struct str s)
+{
+    buf_appendf(msg, "  %c ", sign);
+    if (s.n <= DIFF_ECHO_MAX) {
+        buf_append_n(msg, s.p, s.n);
+    } else {
+        buf_append_n(msg, s.p, DIFF_ECHO_MAX);
+        buf_appendf(msg, "\xE2\x80\xA6[%zu bytes total]", s.n); /* … */
+    }
+    buf_appendc(msg, '\n');
+}
+
 /* Append s to out with \r inserted before every bare \n: shapes old_string
  * and the replacement to a CRLF file when a bare-\n form failed to match. */
 static void crlf_fix(struct str s, struct buf *out)
@@ -6446,8 +6559,8 @@ static char *tool_write(const struct jnode *args, struct tool_img *img_)
         struct buf msg = BUF_INIT;
         buf_appendf(&msg, "edited %.*s (%zu replacement%s)\n", (int)path.n,
                     path.p, count, count == 1 ? "" : "s");
-        buf_appendf(&msg, "  - %.*s\n  + %.*s\n", (int)oldv.n, oldv.p,
-                    (int)newv.n, newv.p);
+        append_diff_side(&msg, '-', oldv);
+        append_diff_side(&msg, '+', newv);
         result = buf_detach(&msg);
     } else {
         result = xasprintf("error: cannot write '%.*s'", (int)path.n, path.p);

@@ -60,6 +60,12 @@ Other environment variables:
 | `KK_CONTEXT_WINDOW` | Assumed context window in tokens (default 262144) |
 | `KK_DUMP_REQ=<path>` | Overwrite that file with every request body, verbatim |
 | `KK_FORCE_CONSOLE` | Emit VT even when stdout is redirected (for testing) |
+| `KK_IMG_MAX_EDGE` | Long-edge cap for pasted images before PNG encoding (default 1568; below 64 disables) |
+
+Images are capped at 1568px on the long edge (bilinear, aspect preserved)
+before encoding: vision endpoints downscale past that themselves and refuse
+base64 bodies over 5–10MB, so a 4K screenshot would otherwise encode to a
+~25MB PNG — a ~33MB request that gets rejected, or costs 2–3x the tokens.
 
 `--help` and `--version` finish the flag list. Unknown flags exit `2`; a turn
 cancelled with Ctrl+C exits `130`.
