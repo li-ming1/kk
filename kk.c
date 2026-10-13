@@ -761,11 +761,8 @@ static size_t jstr_end(const char *s, size_t n, size_t i, struct str *out)
             return (size_t)-1; /* buffer exhausted: unterminated */
         i += JSTR_PROBE;
 
-        /* window phase: ONE pass finds either delimiter. The old shape ran
-         * memchr for '"' across the window and then a second memchr for
-         * '\\' bounded by that quote — escape-free strings (the norm) paid
-         * the same range twice. jstr_probe_hit is the same 16-byte vector
-         * compare, so one pass decides. */
+        /* window phase: ONE pass finds either delimiter, so an escape-free
+         * string (the norm) does not pay the same range twice. */
         size_t rest = n - i;
         size_t win = rest > JSTR_WINDOW ? JSTR_WINDOW : rest;
         size_t k2 = jstr_probe_hit(s, i, win);
@@ -1108,33 +1105,41 @@ static char *jstr_or(const struct jnode *node, const char *fallback)
 
 /* --- serialization helpers -------------------------------------------- */
 
-/* A word of 8 bytes needs the escape pass when any byte is a control
- * character, '"' or '\\'. The HAS_* tests over-match occasionally
- * (borrow chains) — a positive just falls back to the per-byte loop,
- * which is exact. */
-#define ESC_HAS_LESS20(w)                                                     \
-    ((((w) - 0x2020202020202020ULL) & ~(w)) & 0x8080808080808080ULL)
-#define ESC_HAS_EQ(w, c)                                                      \
-    ((((w) ^ (c)*0x0101010101010101ULL) - 0x0101010101010101ULL)              \
-     & ~((w) ^ (c)*0x0101010101010101ULL) & 0x8080808080808080ULL)
-
+/* json_escape_append copies in bulk and only walks byte by byte across a span
+ * that actually needs escaping. Session logs and request serialization push
+ * megabytes of mostly plain UTF-8 through it every round, so the clean-run
+ * skip decides the cost: SSE2 clears sixteen bytes per compare.
+ *
+ * SSE2 has no unsigned byte compare. `c < 0x20` unsigned is
+ * `0x20 > c` AND `c >= 0x80` false — i.e. the signed compare against 0x20 with
+ * the high-bit bytes masked back out, because those signed "less than 0x20"
+ * while unsigned they are ordinary text. The two equality tests are exact. */
 static void json_escape_append(struct buf *b, const char *s, size_t n)
 {
-    /* escape-free runs are copied in bulk; escapes are all 2 bytes.
-     * Session-log and request serialization push megabytes of mostly plain
-     * UTF-8 through here, so plain runs are skipped 8 bytes at a time and
-     * only escape-hitting spans walk byte by byte. */
     buf_reserve(b, n + 16);
     size_t start = 0, i = 0;
     while (i < n) {
-        while (i + 8 <= n) {
-            uint64_t w;
-            memcpy(&w, s + i, 8);
-            if (ESC_HAS_LESS20(w) | ESC_HAS_EQ(w, '"')
-                | ESC_HAS_EQ(w, '\\'))
+#if defined(_M_X64)
+        const __m128i c20 = _mm_set1_epi8(0x20);
+        const __m128i cq = _mm_set1_epi8('"');
+        const __m128i cbs = _mm_set1_epi8('\\');
+        const __m128i zero = _mm_setzero_si128();
+        while (i + 16 <= n) {
+            __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+            __m128i high = _mm_cmpgt_epi8(zero, v);
+            __m128i low = _mm_andnot_si128(high, _mm_cmplt_epi8(v, c20));
+            unsigned m = (unsigned)_mm_movemask_epi8(
+                _mm_or_si128(low, _mm_or_si128(_mm_cmpeq_epi8(v, cq),
+                                               _mm_cmpeq_epi8(v, cbs))));
+            if (m) {
+                unsigned long bit;
+                _BitScanForward(&bit, m);
+                i += (size_t)bit;
                 break;
-            i += 8;
+            }
+            i += 16;
         }
+#endif
         while (i < n) {
             unsigned char c = (unsigned char)s[i];
             char ubuf[8];
@@ -1150,7 +1155,7 @@ static void json_escape_append(struct buf *b, const char *s, size_t n)
             case '\t': esc = "\\t"; esclen = 2; break;
             default:
                 if (c >= 0x20) {
-                    i++; /* plain byte inside a dirty word */
+                    i++; /* plain byte: ASCII or UTF-8 lead/continuation */
                     continue;
                 }
                 esclen = (size_t)snprintf(ubuf, sizeof ubuf, "\\u%04x", c);
@@ -1160,8 +1165,10 @@ static void json_escape_append(struct buf *b, const char *s, size_t n)
             buf_append_n(b, s + start, i - start);
             buf_append_n(b, esc, esclen);
             start = ++i;
-            break; /* one escape emitted: retry the 8-byte skip */
+            break; /* one escape emitted: retry the vector skip */
         }
+        if (i >= n)
+            break;
     }
     buf_append_n(b, s + start, n - start);
 }
@@ -1349,14 +1356,13 @@ static size_t u8_prev(const char *s, size_t i)
 }
 
 /* The largest cut position <= i that does not split a codepoint: a byte at the
- * cut that is a continuation means its sequence started earlier. (u8_prev
- * answers the other question — where the codepoint ending at or before i-1
- * begins.) Display caps that must not print half a glyph all need this one. */
+ * cut that is a continuation means its sequence started earlier. This is
+ * u8_prev(s, i + 1) — the byte at i is examined instead of the one before it —
+ * and every display cap that must not print half a glyph goes through one
+ * definition of the boundary. */
 static size_t u8_floor(const char *s, size_t i)
 {
-    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80)
-        i--;
-    return i;
+    return u8_prev(s, i + 1);
 }
 
 static size_t u8_next(const char *s, size_t n, size_t i)
@@ -1807,14 +1813,15 @@ static void trunc_cols(char *dst, size_t cap, const char *src, int max_cols)
         size_t clen = u8_decode(src + i, n - i, &cp);
         if (clen == 0)
             clen = 1;
-        if (w + (int)u8_cp_width(cp) > max_cols) {
+        int cw = u8_cp_width(cp);
+        if (w + cw > max_cols) {
             cut = 1;
             break;
         }
         memcpy(dst + o, src + i, clen);
         o += clen;
         i += clen;
-        w += (int)u8_cp_width(cp);
+        w += cw;
     }
     if (cut)
         o += (size_t)snprintf(dst + o, cap - o, "…");
@@ -2754,9 +2761,8 @@ static void painter_append_styled(struct painter *p, const char *s, size_t n)
 
 
 /* Plain streaming feed (think channel): direct append, hard wrap. Runs of
- * well-formed codepoints go to the painter as RAW bytes in one call — the
- * painter decodes each codepoint once for width/wrap; the old per-codepoint
- * path paid a decode → re-encode → decode round-trip on every character. */
+ * well-formed codepoints go to the painter as RAW bytes in one call — it
+ * decodes each codepoint once, for width and wrap. */
 static void painter_feed_plain(struct painter *p, const char *s, size_t n)
 {
     size_t i = 0;
@@ -3111,8 +3117,7 @@ static void rd_emit_hr(struct renderer *r)
     int cols = p->usable < 40 ? p->usable : 40;
     if (cols > 0) {
         /* "─" is one 3-byte glyph: cols columns are a prefix of its 40-fold
-         * repetition, so the whole rule is ONE append — the old loop paid a
-         * strlen per glyph */
+         * repetition, so the whole rule is ONE append */
         static const char hr[] =
             "────────────────────────────────────────────────";
         buf_append_n(&p->pending, hr, (size_t)cols * 3);
@@ -5105,6 +5110,26 @@ static void conv_free(struct conversation *cv)
  * (wire=0). The shapes differ only in the tool_calls member. */
 static void msg_serialize(struct buf *b, const struct message *m, int wire)
 {
+    /* Size the fragment before writing a byte of it. Every member is written
+     * from a length the caller already holds, and escaping only ever grows a
+     * plain run by nothing — so this is exact for the overwhelmingly common
+     * escape-free message and one doubling short for the rest. Without it a
+     * 100KB tool result grew through ~10 doublings, each copying everything
+     * written so far. */
+    size_t need = 192 + strlen(m->role);
+    if (m->content)
+        need += strlen(m->content);
+    if (m->tool_call_id)
+        need += strlen(m->tool_call_id);
+    for (size_t i = 0; i < m->n_calls; i++) {
+        need += strlen(m->calls[i].id) + strlen(m->calls[i].name);
+        if (m->calls[i].args)
+            need += strlen(m->calls[i].args);
+    }
+    for (size_t i = 0; i < m->images.n; i++)
+        need += strlen(m->images.p[i].mime) + strlen(m->images.p[i].b64);
+    buf_reserve(b, need);
+
     buf_appends(b, wire ? "{\"role\":\"" : "{\"type\":\"message\",\"role\":\"");
     json_escape_append(b, m->role, strlen(m->role));
     buf_appends(b, "\",\"content\":");
@@ -6554,24 +6579,41 @@ static size_t read_line_prefix(char *dst, size_t line_no)
     return o;
 }
 
+/* One read result is capped at this many bytes whatever `limit` says. A page
+ * of `limit` lines, each already capped at KK_LINE_COLS, reaches 800KB on a
+ * wide-line file — ~200k tokens in a single tool result, which the model then
+ * re-pays on every round of the turn and usually reads a fraction of. 64KB
+ * passes any ordinary source file whole (roughly 1300 lines) and bounds the
+ * pathological case by 12x; the trailer names the exact line to continue at,
+ * so paging costs one extra round instead of a 12x larger bill forever. */
+#define READ_PAGE_BYTES (64 * 1024)
+
 /* Format lines offset..offset+limit of one buffer, numbering as it goes. Its
  * own function because the per-line work is three calls, and inside the big
  * tool_read they do not all inline: the same loop measured in a small function
- * ran at half the cost. */
+ * ran at half the cost. *trunc_out reports that the byte budget (not the line
+ * limit) is what stopped the page. */
 static void read_page(struct buf *out, const char *data, size_t len,
-                      size_t offset, size_t limit, size_t *emitted_out,
-                      size_t *last_out)
+                      size_t offset, size_t limit, size_t max_bytes,
+                      size_t *emitted_out, size_t *last_out, int *trunc_out)
 {
-    size_t line_no = 0, emitted = 0, last = 0;
+    size_t line_no = 0, emitted = 0, last = 0, bytes = 0;
+    int trunc = 0;
     const char *p = data, *end = data + len;
     while (p < end && emitted < limit) {
         line_no++;
         const char *nl = memchr(p, '\n', (size_t)(end - p));
         size_t llen = nl ? (size_t)(nl - p) : (size_t)(end - p);
         if (line_no >= offset) {
+            if (bytes >= max_bytes) {
+                trunc = 1;
+                break; /* the budget, not the page limit, stops here */
+            }
+            size_t before = out->len;
             char pre[28];
             size_t pn = read_line_prefix(pre, line_no);
             buf_append_line_capped_pfx(out, pre, pn, p, llen);
+            bytes += out->len - before;
             emitted++;
             last = line_no;
         }
@@ -6579,15 +6621,12 @@ static void read_page(struct buf *out, const char *data, size_t len,
     }
     *emitted_out = emitted;
     *last_out = last;
+    *trunc_out = trunc;
 }
 
 /* Read a whole file and answer, from the same open, whether somebody else is
  * holding it. dwShareMode 0 *is* the lock test: if the open succeeds nobody
- * else has the file, and ERROR_SHARING_VIOLATION means they do — so the read
- * path stops paying a second CreateFileW to learn what the first already
- * proved. The one deliberate difference from the old two-open order: a file
- * held exclusively now reports "locked" instead of "cannot read", which is
- * the truer message. */
+ * else has the file, and ERROR_SHARING_VIOLATION means they do. */
 static char *file_read_excl(struct str path, size_t *out_len, int *locked,
                             unsigned long long *too_big_at)
 {
@@ -6672,13 +6711,16 @@ static char *tool_read(const struct jnode *args, struct tool_img *img)
      * scan: the model is told the file's full line count instead of being left
      * to guess, without a second walk over the bytes it will not see. */
     size_t emitted = 0, last = 0;
-    read_page(&out, data, len, (size_t)offset, (size_t)limit, &emitted, &last);
+    int capped = 0;
+    read_page(&out, data, len, (size_t)offset, (size_t)limit,
+              (size_t)env_i64("KK_READ_MAX_BYTES", 1024, READ_PAGE_BYTES),
+              &emitted, &last, &capped);
     if (ts.lines == 0)
         buf_appends(&out, "(empty file)\n");
     else if (emitted == 0)
         buf_appendf(&out, "[offset %zu is beyond end of file: %zu lines]\n",
                     (size_t)offset, ts.lines);
-    else if (emitted == (size_t)limit && last < ts.lines)
+    else if (last < ts.lines && (emitted == (size_t)limit || capped))
         buf_appendf(&out, "[showing lines %zu-%zu of %zu; "
                           "continue with offset %zu]\n",
                     (size_t)offset, last, ts.lines, last + 1);
@@ -6777,11 +6819,9 @@ static char *tool_write(const struct jnode *args, struct tool_img *img_)
                          "bash (Get-Content + Select-Object -Index)");
         goto cleanup;
     }
-    /* One exclusive open answers both questions, as in tool_read: the probe
-     * and the read used to be two CreateFileW calls, and a write of an
-     * existing file is the common case the tool description pushes the model
-     * toward. Message text is unchanged: a sharing violation is the lock, any
-     * other failure is the unreadable file, and a missing file is neither. */
+    /* One exclusive open answers both the lock probe and the read, as in
+     * tool_read. A sharing violation is the lock; any other failure is
+     * the unreadable file; a missing file is neither. */
     size_t len = 0;
     int locked = 0;
     data = file_read_excl(path, &len, &locked, NULL);
@@ -8645,40 +8685,82 @@ static void edit_undo_save(struct editor *e)
     e->undo_valid = 1;
 }
 
+/* Advance one visual row of the draft: on entry *off is that row's first byte,
+ * on return *off is the first byte of the NEXT row (an explicit '\n' is
+ * consumed, an auto-wrap is not) and *row / *col are updated. One definition
+ * of "visual row" for the cursor seek, the window and the row jump alike: if
+ * those three ever disagreed, the caret lands on the wrong line.
+ *
+ * Returns 1 when a row boundary was crossed (the row that just closed is
+ * *row - 1) and 0 when the draft ended INSIDE this row (*off is len, *col is
+ * the column it ended at, and *row is this row's index). Callers cannot tell
+ * those apart from *off alone, and guessing wrong shifts every row after it.
+ *
+ * Printable ASCII is bulk-skipped at one column per byte: a draft is almost
+ * entirely ASCII, and the per-codepoint path paid a decode plus a width
+ * lookup per character on every keystroke. */
+static int edit_row_step(const char *s, size_t len, size_t cols, size_t *off,
+                         int *row, size_t *col)
+{
+    size_t i = *off;
+    while (i < len) {
+        if (s[i] == '\n') {
+            i++;
+            (*row)++;
+            *col = 0;
+            *off = i;
+            return 1;
+        }
+        if (s[i] == '\x1B') {
+            i += 2; /* ESC [ */
+            while (i < len && s[i] != 'm')
+                i++;
+            i++; /* the final 'm' */
+            continue;
+        }
+        unsigned char b = (unsigned char)s[i];
+        if (b >= 0x20 && b < 0x80) {
+            size_t room = cols - *col;
+            if (room == 0)
+                break; /* the row is full: wrap before this byte */
+            size_t run = ascii_run(s + i, room < len - i ? room : len - i);
+            if (run == 0)
+                break; /* a wide glyph comes next: decode it below */
+            i += run;
+            *col += run;
+            continue;
+        }
+        uint32_t cp;
+        size_t cl = u8_decode(s + i, len - i, &cp);
+        if (cl == 0)
+            cl = 1;
+        size_t cw = (size_t)u8_cp_width(cp);
+        if (*col + cw > cols)
+            break;
+        *col += cw;
+        i += cl;
+    }
+    if (i >= len) {
+        *off = i; /* the draft ends inside this row: col stands as it is */
+        return 0;
+    }
+    (*row)++;
+    *col = 0;
+    *off = i;
+    return 1;
+}
+
 /* Walk s[0..len) accumulating the visual row and column: an explicit
  * '\n' resets the column and advances a row, the terminal auto-wraps
  * past the last column, SGR sequences are zero-width. */
 static void edit_walk(const char *s, size_t len, size_t cols, size_t *rows,
                       size_t *col)
 {
-    size_t r = *rows, c = *col, i = 0;
-    while (i < len) {
-        if (s[i] == '\x1B') {
-            i += 2; /* ESC [ */
-            while (i < len && s[i] != 'm')
-                i++;
-            i++;
-            continue;
-        }
-        if (s[i] == '\n') {
-            r++;
-            c = 0;
-            i++;
-            continue;
-        }
-        uint32_t cp;
-        size_t clen = u8_decode(s + i, len - i, &cp);
-        if (clen == 0)
-            clen = 1;
-        size_t w = (size_t)u8_cp_width(cp);
-        if (c + w > cols) {
-            r++;
-            c = 0;
-        }
-        c += w;
-        i += clen;
-    }
-    *rows = r;
+    size_t off = 0, c = 0;
+    int row = 0;
+    while (off < len)
+        edit_row_step(s, len, cols, &off, &row, &c);
+    *rows = (size_t)row;
     *col = c;
 }
 
@@ -8716,35 +8798,21 @@ static int edit_window(const struct editor *e, int wcap, struct edit_vrow *rows,
     int lo = cur_row > wcap - 1 ? cur_row - (wcap - 1) : 0;
     *lo_out = lo;
 
+    /* one pass splits the draft into rows; each range is [start, end) minus
+     * the terminating '\n' — the frame adds its own CRLF */
+    size_t off = 0, w = 0;
     int row = 0, filled = 0;
-    size_t i = 0, rs = 0, w = 0;
-    while (i < e->text.len) {
-        if (e->text.p[i] == '\n') {
-            if (row >= lo && filled < wcap)
-                rows[filled++] = (struct edit_vrow){ rs, i - rs };
-            row++;
-            i++;
-            rs = i;
-            w = 0;
-            continue;
-        }
-        uint32_t cp;
-        size_t cl = u8_decode(e->text.p + i, e->text.len - i, &cp);
-        if (cl == 0)
-            cl = 1;
-        size_t cw = (size_t)u8_cp_width(cp);
-        if (w + cw > cols) { /* terminal auto-wrap: the row ends here */
-            if (row >= lo && filled < wcap)
-                rows[filled++] = (struct edit_vrow){ rs, i - rs };
-            row++;
-            rs = i;
-            w = 0;
-        }
-        w += cw;
-        i += cl;
+    while (off < e->text.len) {
+        size_t start = off;
+        int closed = edit_row_step(e->text.p, e->text.len, cols, &off, &row, &w);
+        size_t end = off;
+        if (end > start && e->text.p[end - 1] == '\n')
+            end--;
+        if ((closed ? row - 1 : row) >= lo && filled < wcap)
+            rows[filled++] = (struct edit_vrow){ start, end - start };
+        if (!closed)
+            break;
     }
-    if (row >= lo && filled < wcap)
-        rows[filled++] = (struct edit_vrow){ rs, e->text.len - rs };
     *total_out = row + 1;
     *cur_row_out = cur_row;
     return filled;
@@ -8795,8 +8863,7 @@ static void edit_cursor_pos(struct editor *e)
 
 static void edit_render(struct editor *e)
 {
-    /* one composed frame, one console write: the five separate writes
-     * this used to be cost a lock plus a syscall each, per keystroke */
+    /* one composed frame, one console write per keystroke */
     static struct buf frame; /* editor runs on the main thread only */
     buf_reset(&frame);
     int old_home = e->home_row, old_drawn = e->drawn_rows;
@@ -9013,47 +9080,33 @@ static int edit_visrows(const struct editor *e)
 static size_t edit_row_at(const struct editor *e, int trow, size_t tcol)
 {
     size_t cols = (size_t)g_term_cols;
+    size_t off = 0, w = 0;
     int row = 0;
-    size_t i = 0, rs = 0, w = 0;
-    while (i < e->text.len) {
-        if (row == trow)
-            break;
-        if (e->text.p[i] == '\n') {
-            row++;
-            i++;
-            rs = i;
-            w = 0;
+    while (row < trow) {
+        if (off >= e->text.len)
+            return e->cur; /* past the last row: no move */
+        edit_row_step(e->text.p, e->text.len, cols, &off, &row, &w);
+    }
+    /* off is the target row's first byte: walk it to the kept column */
+    while (off < e->text.len && e->text.p[off] != '\n' && w < tcol) {
+        if (e->text.p[off] == '\x1B') {
+            off += 2;
+            while (off < e->text.len && e->text.p[off] != 'm')
+                off++;
+            off++;
             continue;
         }
         uint32_t cp;
-        size_t cl = u8_decode(e->text.p + i, e->text.len - i, &cp);
+        size_t cl = u8_decode(e->text.p + off, e->text.len - off, &cp);
         if (cl == 0)
             cl = 1;
         size_t cw = (size_t)u8_cp_width(cp);
-        if (w + cw > cols) {
-            row++;
-            rs = i;
-            w = 0;
-        }
-        w += cw;
-        i += cl;
-    }
-    if (row != trow)
-        return e->cur; /* past the last row: no move */
-    /* walk the target visual row to the kept column */
-    size_t j = rs, w2 = 0;
-    while (j < e->text.len && e->text.p[j] != '\n') {
-        uint32_t cp;
-        size_t cl = u8_decode(e->text.p + j, e->text.len - j, &cp);
-        if (cl == 0)
-            cl = 1;
-        size_t cw = (size_t)u8_cp_width(cp);
-        if (w2 + cw > cols || w2 >= tcol)
+        if (w + cw > cols)
             break;
-        w2 += cw;
-        j += cl;
+        w += cw;
+        off += cl;
     }
-    return j;
+    return off;
 }
 
 /* Up/down inside a multi-row draft: move the cursor one visual row,
@@ -9752,18 +9805,22 @@ static enum edit_result edit_line(struct editor *e, char **out)
 static void sess_pick_draw(struct sess_row *rows, int n, int all, int from,
                            int sel, int list_rows)
 {
-    out_printf("\x1b[1;1H\x1b[2K\x1b[1mSessions\x1b[0m \x1b[2m%d", n);
+    /* one composed frame, one console write: this redraws on every arrow key,
+     * and as separate out_printf calls it cost a lock plus a vsnprintf plus a
+     * WriteConsole per row */
+    static struct buf frame;
+    buf_reset(&frame);
+    buf_appendf(&frame, "\x1b[1;1H\x1b[2K\x1b[1mSessions\x1b[0m \x1b[2m%d", n);
     if (all > n)
-        out_printf("/%d", all); /* older ones exist but are not listed */
-    out_puts("\x1b[0m");
-    ui_rule(2);
+        buf_appendf(&frame, "/%d", all); /* older ones exist but are not listed */
+    buf_appends(&frame, "\x1b[0m");
+    buf_appendf(&frame, "\x1b[2;1H\x1b[2K");
+    rule_buf(&frame, 0);
     for (int i = 0; i < list_rows; i++) {
         int r = from + i;
-        int row = 3 + i;
-        if (r >= n) {
-            out_printf("\x1b[%d;1H\x1b[2K", row);
+        buf_appendf(&frame, "\x1b[%d;1H\x1b[2K", 3 + i);
+        if (r >= n)
             continue;
-        }
         char meta[32];
         snprintf(meta, sizeof meta, "%s · %d turn%s", rows[r].age,
                  rows[r].turns, rows[r].turns == 1 ? "" : "s");
@@ -9773,18 +9830,17 @@ static void sess_pick_draw(struct sess_row *rows, int n, int all, int from,
             avail = 12;
         char prev[128];
         trunc_cols(prev, sizeof prev, rows[r].preview, avail);
-        out_printf("\x1b[%d;1H\x1b[2K", row);
-        if (r == sel)
-            out_printf("\x1b[1m> %2d %s", r + 1, prev);
-        else
-            out_printf("\x1b[2m  %2d %s", r + 1, prev);
+        buf_appendf(&frame, r == sel ? "\x1b[1m> %2d %s" : "\x1b[2m  %2d %s",
+                    r + 1, prev);
         if (g_term_cols - mw >= 1)
-            out_printf("\x1b[%dG%s", g_term_cols - mw, meta);
-        out_puts("\x1b[0m");
+            buf_appendf(&frame, "\x1b[%dG%s", g_term_cols - mw, meta);
+        buf_appends(&frame, "\x1b[0m");
     }
-    ui_rule(g_term_rows - 1);
-    out_printf("\x1b[%d;1H\x1b[2m↑↓ navigate   enter resume   esc close\x1b[0m",
-               g_term_rows);
+    buf_appendf(&frame, "\x1b[%d;1H\x1b[2K", g_term_rows - 1);
+    rule_buf(&frame, 0);
+    buf_appendf(&frame, "\x1b[%d;1H\x1b[2m↑↓ navigate   enter resume   esc close\x1b[0m",
+                g_term_rows);
+    out_frame_write(frame.p, frame.len);
 }
 
 /* Keep the sliding window covering the selection: after a navigation key
@@ -9936,7 +9992,9 @@ static const char KK_SYSTEM_PROMPT[] =
     "filters by file) when the path is unknown, read before "
     "changing anything, change files with the write tool (pass old_string "
     "for precise replacements, copying text exactly from the read output), "
-    "and verify changes by running commands with the bash tool. Batch "
+    "and verify changes by running commands with the bash tool, which takes "
+    "a whole script: chain independent commands with ';' in ONE call instead "
+    "of spending a call each. Batch "
     "ruthlessly: decide everything you need before acting and emit it as "
     "ONE round of parallel calls — 3 or more calls per round is the norm "
     "and a single call in a round is a defect, because every extra round "
@@ -9999,11 +10057,11 @@ static char *workspace_snapshot(void)
     return buf_detach(&b);
 }
 
-/* Every round re-pays the static head, and nothing used to add it up: one
- * project's AGENTS.md measured 22.9KB ≈ 6.8k tokens per round. Sizes are what
- * actually got appended (section headers included), pre-escape; the wire adds
- * a few percent. Printed once per interactive session, right where the prompt
- * is first built, so the number lands before the round that pays it. */
+/* Every round re-pays the static head: one
+ * project's AGENTS.md measured 22.9KB ≈ 6.8k tokens per round. Sizes are
+ * what actually got appended (section headers included), pre-escape; the
+ * wire adds a few percent. Printed once per interactive session, right
+ * where the prompt is first built, so the number lands before that round. */
 #define HEAD_BYTES_PER_TOKEN 3.4 /* median req / prompt_tokens over logs */
 static const struct buf *tools_json_block(void);
 static void head_report(size_t agents, size_t skills, size_t snap)
@@ -10606,15 +10664,17 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
         size_t cmp = body.len < prev_body.len ? body.len : prev_body.len;
         size_t sh = 0;
         st->request_prev = prev_body.len != 0;
-        /* 8 bytes at a time: the shared prefix is usually the whole body */
-        while (sh + 8 <= cmp) {
-            uint64_t a, b;
-            memcpy(&a, body.p + sh, 8);
-            memcpy(&b, prev_body.p + sh, 8);
-            if (a != b)
+        /* 16 bytes at a time: bodies run to megabytes and the shared prefix
+         * is normally the whole of everything but the new tail */
+#if defined(_M_X64)
+        while (sh + 16 <= cmp) {
+            __m128i a = _mm_loadu_si128((const __m128i *)(body.p + sh));
+            __m128i b = _mm_loadu_si128((const __m128i *)(prev_body.p + sh));
+            if (_mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) != 0xFFFF)
                 break;
-            sh += 8;
+            sh += 16;
         }
+#endif
         while (sh < cmp && body.p[sh] == prev_body.p[sh])
             sh++;
         st->request_shared = sh;
@@ -10734,14 +10794,28 @@ static size_t conv_rfind(const struct conversation *cv, const char *role)
     return cv->msgs.n;
 }
 
-/* Overflow recovery when the whole history IS the current turn (no head
- * to fold): replace earlier tool outputs with visible stubs, keeping only the
- * most recent one verbatim — tool output is the only thing that can grow
- * without bound inside one turn. The stubs are transient for the retried
- * request; the session log already holds the real output it recorded, and the
- * screen showed it live. Returns 1 when something was stubbed and, if `freed`
- * is given, reports the bytes it removed from what the next request carries. */
-static int conv_stub_tool_results(struct conversation *cv, size_t *freed)
+/* Replace bulky tool output with a short visible stub. One walk, three
+ * settings, because the walk is the only interesting part:
+ *
+ *   routine recycling (min_bytes = TOOL_STUB_MIN, min_rounds = TOOL_KEEP_ROUNDS)
+ *     runs before every request: a result the model has already had min_rounds
+ *     requests to use is re-paid forever otherwise (corpus numbers: re-sent
+ *     history is 26x the generated text, one 49-round turn paid 1.0M tokens
+ *     mostly from 20-60KB read results it had stopped looking at). The slack
+ *     guarantees the model never loses output it has not seen, and anything
+ *     recycled is one call away from being fetched back.
+ *
+ *   overflow recovery (0, 0, keep_last) runs when the whole history IS the
+ *     current turn, so there is no head to fold: every tool output before the
+ *     last one goes and the freshest stays verbatim. Those stubs are transient
+ *     for the retried request: the session log already holds the real output
+ *     it recorded, and the screen showed it live.
+ *
+ * Returns 1 when something was stubbed and, if freed is given, reports the
+ * bytes it took out of what the next request carries. */
+static int conv_stub_tool_results(struct conversation *cv, size_t *freed,
+                                  size_t min_bytes, size_t min_rounds,
+                                  int keep_last)
 {
     size_t last = conv_rfind(cv, "tool");
     if (last == cv->msgs.n)
@@ -10754,62 +10828,34 @@ static int conv_stub_tool_results(struct conversation *cv, size_t *freed)
         return 0;
 
     int n = 0;
-    size_t bytes = 0;
-    for (size_t i = 0; i <= last; i++) {
-        struct message *m = &cv->msgs.p[i];
-        if (strcmp(m->role, "tool") != 0 || !m->content)
-            continue;
-        if (i == last && n_tools > 1)
-            continue; /* with older outputs to stub, the freshest one
-                         stays verbatim */
-        size_t len = strlen(m->content);
-        free(m->content);
-        m->content = xasprintf("[earlier tool output elided: %zu bytes]",
-                               len);
-        free(m->json_cache); /* the cached request fragment still holds
-                              * the full output */
-        m->json_cache = NULL;
-        bytes += len;
-        n++;
-    }
-    if (!n)
-        return 0;
-    if (freed)
-        *freed = bytes;
-    out_printf("⚠ %d 条较早的工具输出（共 %zu 字节）已换成占位，腾出上下文\r\n",
-               n, bytes);
-    return 1;
-}
-/* Routine recycling, run before every request: a tool result the model has
- * already had two rounds to use is re-paid forever otherwise (corpus numbers:
- * re-sent history is 26x the generated text, one 49-round turn paid 1.0M
- * tokens mostly from 20-60KB read results it stopped looking at). The
- * two-round slack guarantees the model never loses output it has not seen,
- * and anything recycled is one call away from being fetched back. `min_rounds`
- * counts assistant messages after the result — every one of them is a request
- * that already carried it; `min_bytes` skips results too small to re-run. */
-static int conv_recycle_tool_results(struct conversation *cv, size_t *freed,
-                                     size_t min_bytes, size_t min_rounds)
-{
-    size_t rounds = 0; /* sightings so far walking back from the tail */
-    int n = 0;
-    size_t bytes = 0;
+    size_t bytes = 0, rounds = 0; /* requests that already carried it */
     for (size_t i = cv->msgs.n; i > 0; i--) {
         struct message *m = &cv->msgs.p[i - 1];
         if (strcmp(m->role, "assistant") == 0) {
             rounds++;
             continue;
         }
-        if (strcmp(m->role, "tool") != 0 || !m->content)
+        if (i - 1 > last || strcmp(m->role, "tool") != 0 || !m->content)
             continue;
+        if (keep_last && i - 1 == last && n_tools > 1)
+            continue; /* with older outputs to stub, the freshest one stays */
         if (rounds < min_rounds)
             continue;
         size_t len = strlen(m->content);
         if (len <= min_bytes)
-            continue;
+            continue; /* too small to be worth re-running the call for */
         free(m->content);
+        /* The first stub of a pass carries the reason. The model has no other
+         * way to learn its context was trimmed — the ♻ line goes to the screen,
+         * not the conversation — so without this it keeps reading whole files
+         * and rides the context down into the overflow retry. One clause, once
+         * per pass, riding on an existing tool message: a synthetic user turn
+         * would read as the human speaking and hand control back in /goal. */
         m->content = xasprintf("[tool output recycled: %zu bytes — re-run "
-                               "the call above to fetch it again]", len);
+                               "the call above to fetch it again%s]", len,
+                               n ? ""
+                                 : "; context trimmed to fit — prefer narrow "
+                                   "offset/limit reads from here on");
         free(m->json_cache); /* the cached fragment still holds the full
                               * output: it must go with the content */
         m->json_cache = NULL;
@@ -10820,8 +10866,9 @@ static int conv_recycle_tool_results(struct conversation *cv, size_t *freed,
         return 0;
     if (freed)
         *freed = bytes;
-    if (bytes >= 8192) /* per-round aging recycles a bit every round: only
-                        * a real saving is worth a line on screen */
+    /* per-round aging frees a bit every round: only a real saving is worth a
+     * line on screen */
+    if (bytes >= 8192)
         out_printf("♻ %d 条较早的工具输出（共 %zu 字节）换成占位，"
                    "重跑调用即可取回\r\n", n, bytes);
     return 1;
@@ -10955,6 +11002,22 @@ static int conv_compact(struct config *cfg, struct conversation *cv,
     return 1;
 }
 
+/* Commit whatever text a round produced as the assistant message it was. The
+ * stream already painted it, so the conversation must carry it too — display ==
+ * model view holds even for a round that was cut short.
+ *
+ * It deliberately does NOT attach the in-flight tool_calls: calls that did not
+ * run would leave the next request holding tool results with no assistant
+ * message to own them, which is a 400 the whole session then inherits. */
+static void turn_commit_text(struct conversation *cv, struct session_log *slog,
+                             struct stream_state *st)
+{
+    if (!st->content.len)
+        return;
+    struct message *m = conv_add_take(cv, "assistant", buf_detach(&st->content));
+    session_log_message(slog, m);
+}
+
 /* Take everything queued, echoing each line as the user turn it
  * becomes, appending to the conversation and the session log, and
  * clearing the pinned block. Main thread only. */
@@ -10991,7 +11054,7 @@ static int queue_pending(void)
     return has;
 }
 
-/* One parallel read call: parse + execute on its own thread, filling the
+/* One parallel read-only call: parse + execute on its own thread, filling the
  * slot the agent loop reaps in call order. */
 struct para_slot {
     const char *name;
@@ -11003,7 +11066,95 @@ struct para_slot {
     struct arena ta;
 };
 
-static DWORD WINAPI para_read_thread(LPVOID arg)
+/* Tools that only look at the workspace. They are the only ones a batch may
+ * overlap: each answers independently of the others, none touches the shell
+ * session whose cwd and environment are ordered state, and none writes.
+ * grep and find belong here because they are the slowest reads in the set —
+ * fff gives grep a 2s time budget per call, so three of them in one batch cost
+ * 6s serially and 2s in parallel. fff's own locking makes concurrent searches
+ * on the shared handle safe (its unsafe-no-lock parameters are documented as
+ * ignored: the library serializes internally). */
+static int tool_readonly(const char *name)
+{
+    return strcmp(name, "read") == 0 || strcmp(name, "grep") == 0
+        || strcmp(name, "find") == 0;
+}
+
+/* Every tool_call in a committed assistant message needs a tool result, or the
+ * next request is a 400 that --continue replays for the rest of the session.
+ * This fills in the ones that will not run. */
+static void turn_stub_rest(struct conversation *cv, struct session_log *slog,
+                           struct tool_call_rec *calls, size_t from, size_t to,
+                           const char *why)
+{
+    for (size_t j = from; j < to; j++) {
+        struct message *stub = conv_add(cv, "tool", why);
+        stub->tool_call_id = xstrdup(calls[j].id);
+        session_log_message(slog, stub);
+    }
+}
+
+/* --- degenerate tool thrash ------------------------------------------- */
+/* The same call, verbatim, THRASH_MAX times in one turn. Signatures are copied
+ * rather than pointed at, because the argument strings live in conversation
+ * messages that compaction may drop mid-turn. Tracking stops once THRASH_BUDGET
+ * is spent, which costs the detector nothing in practice: a loop repeats ONE
+ * signature, and the first one is always recorded. */
+#define THRASH_MAX 3
+#define THRASH_BUDGET (256 * 1024)
+
+struct thrash_rec {
+    char *name;
+    char *args;
+    int count;
+};
+static struct thrash_rec *g_thrash;
+static size_t g_thrash_n, g_thrash_cap, g_thrash_bytes;
+
+static void thrash_reset(void)
+{
+    for (size_t i = 0; i < g_thrash_n; i++) {
+        free(g_thrash[i].name);
+        free(g_thrash[i].args);
+    }
+    g_thrash_n = 0;
+    g_thrash_bytes = 0;
+}
+
+/* Set when a call repeated THRASH_MAX times: the turn ends on that instead of
+ * looping. File scope because it is written deep in the tool loop and read
+ * after it; one agent thread runs at a time, so no lock is needed. */
+static int g_thrash_stop;
+
+static int thrash_hit(const char *name, const char *args)
+{
+    size_t la = args ? strlen(args) : 0;
+    for (size_t i = 0; i < g_thrash_n; i++) {
+        if (strcmp(g_thrash[i].name, name) != 0)
+            continue;
+        if (strlen(g_thrash[i].args) != la)
+            continue;
+        if (la && memcmp(g_thrash[i].args, args, la) != 0)
+            continue;
+        if (++g_thrash[i].count >= THRASH_MAX)
+            return 1;
+        return 0;
+    }
+    if (g_thrash_bytes + la + strlen(name) + 1 > THRASH_BUDGET)
+        return 0;
+    if (g_thrash_n == g_thrash_cap) {
+        g_thrash_cap = g_thrash_cap ? g_thrash_cap * 2 : 32;
+        g_thrash = xrealloc(g_thrash, g_thrash_cap * sizeof *g_thrash);
+    }
+    g_thrash[g_thrash_n].name = xstrdup(name);
+    g_thrash[g_thrash_n].args = xstrndup(args ? args : "", la);
+    g_thrash[g_thrash_n].count = 1;
+    g_thrash_bytes += la + strlen(name) + 1;
+    g_thrash_n++;
+    return 0;
+}
+
+static DWORD WINAPI para_readonly_thread(LPVOID arg)
 {
     struct para_slot *s = arg;
     arena_init(&s->ta, 8 * 1024);
@@ -11055,6 +11206,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
     InterlockedExchange(&g_busy, 1);
     g_turn_start = GetTickCount();
     g_stream_bytes = 0;
+    thrash_reset(); /* per turn: the loop restarts the clock every user turn */
+    g_thrash_stop = 0;
     if (g_dock)
         status_repaint(); /* busy status right under the prompt */
     HANDLE spinner = CreateThread(NULL, 0, spinner_thread, NULL, 0, NULL);
@@ -11066,8 +11219,8 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
          * early result for the whole loop. The two-round slack means the
          * model has already seen anything this drops. */
         if (auto_compact)
-            conv_recycle_tool_results(cv, NULL, TOOL_STUB_MIN,
-                                      TOOL_KEEP_ROUNDS);
+            conv_stub_tool_results(cv, NULL, TOOL_STUB_MIN,
+                                   TOOL_KEEP_ROUNDS, 0);
         renderer_init(&g_renderer);
         renderer_set_width(&g_renderer);
         struct stream_state st;
@@ -11148,6 +11301,10 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 /* enter steer: the new text becomes the user turn
                  * the model answers right now */
                 InterlockedExchange(&g_steer, 0);
+                /* keep what it already said. Those tokens are spent, the
+                 * text is already on screen, and dropping it makes the model
+                 * write the same paragraph again on the next round. */
+                turn_commit_text(cv, slog, &st);
                 stream_state_free(&st);
                 turn_feed_queue(cv, slog);
                 continue;
@@ -11177,7 +11334,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                                (long long)compact_window_tokens());
                 int recovered = conv_compact(cfg, cv, slog);
                 if (!recovered)
-                    recovered = conv_stub_tool_results(cv, NULL);
+                    recovered = conv_stub_tool_results(cv, NULL, 0, 0, 1);
                 if (recovered) {
                     compacted_once = 1;
                     stream_state_free(&st);
@@ -11232,11 +11389,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             /* no tool will run, so nothing will clear the generation
              * progress the way the tool loop does below */
             g_tick_label[0] = '\0';
-            if (st.content.len) {
-                struct message *m = conv_add_take(cv, "assistant",
-                                                  buf_detach(&st.content));
-                session_log_message(slog, m);
-            }
+            turn_commit_text(cv, slog, &st);
             if (st.finish == FINISH_LENGTH) {
                 /* the model hit its output cap mid-answer: the human must
                  * see that the reply is incomplete — display == model view
@@ -11278,17 +11431,38 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
          * (waiting): the spinner must go quiet before the tool lines print,
          * or it stamps over them */
         InterlockedExchange(&g_busy, 2);
+        /* A read-only call repeated verbatim inside one batch is work already
+         * paid for: it runs nothing and answers with a stub pointing at the
+         * result the model can read in this same conversation. That saves the
+         * I/O and — more to the point — keeps one copy of the text instead of
+         * two, where every later round would re-send both. */
+        int *dup = xcalloc(n_calls, sizeof *dup);
+        for (size_t i = 0; i < n_calls; i++) {
+            if (!tool_readonly(calls[i].name))
+                continue;
+            size_t la = calls[i].args ? strlen(calls[i].args) : 0;
+            for (size_t j = 0; j < i && !dup[i]; j++) {
+                if (dup[j] || !tool_readonly(calls[j].name)
+                    || strcmp(calls[i].name, calls[j].name) != 0)
+                    continue;
+                size_t lb = calls[j].args ? strlen(calls[j].args) : 0;
+                if (lb == la && (!la || memcmp(calls[i].args, calls[j].args,
+                                               la) == 0))
+                    dup[i] = 1;
+            }
+        }
         /* Leading read-only calls run in parallel: the model emits them in one
-         * batch precisely because they are independent, and a read is a pure
-         * I/O wait. Only the leading run of reads qualifies — a read sitting
-         * behind a write in the same batch may be meant to see that write's
-         * result. Results still join, display and log in call order: display
-         * == model view. */
+         * batch precisely because they are independent, and each is a pure
+         * I/O wait. Only the leading run qualifies — a read sitting behind a
+         * write in the same batch may be meant to see that write's result.
+         * Results still join, display and log in call order: display ==
+         * model view. */
         size_t n_para = 0;
-        while (n_para < n_calls && strcmp(calls[n_para].name, "read") == 0)
+        while (n_para < n_calls && tool_readonly(calls[n_para].name)
+               && !dup[n_para])
             n_para++;
         if (n_para < 2)
-            n_para = 0; /* one read gains nothing from a thread, and every
+            n_para = 0; /* one call gains nothing from a thread, and every
                          * `i < n_para` below indexes the slot array that only
                          * the >=2 branch allocates */
         struct para_slot *para = NULL;
@@ -11297,7 +11471,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             for (size_t k = 0; k < n_para; k++) {
                 para[k].name = calls[k].name;
                 para[k].args_json = calls[k].args;
-                para[k].th = CreateThread(NULL, 0, para_read_thread,
+                para[k].th = CreateThread(NULL, 0, para_readonly_thread,
                                           &para[k], 0, NULL);
                 if (!para[k].th) {
                     /* thread starvation: drain what did start and fall back
@@ -11317,11 +11491,21 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 }
             }
             /* one label for the whole parallel burst: naming a single tool
-             * while N run would be a lie, and silence would read as a hang */
+             * while N run would be a lie, and silence would read as a hang.
+             * Distinct tool names, in first-appearance order. */
             if (para) {
+                char kinds[64] = { 0 };
+                size_t kn = 0;
+                for (size_t k = 0; k < n_para && kn + 8 < sizeof kinds; k++) {
+                    if (strstr(kinds, calls[k].name))
+                        continue;
+                    kn += (size_t)snprintf(kinds + kn, sizeof kinds - kn,
+                                           "%s%s", kn ? "+" : "",
+                                           calls[k].name);
+                }
                 AcquireSRWLockExclusive(&g_out_lock);
-                snprintf(g_tick_label, sizeof g_tick_label, "并行 read ×%zu",
-                         n_para);
+                snprintf(g_tick_label, sizeof g_tick_label, "并行 %s ×%zu",
+                         kinds, n_para);
                 g_tick_start = GetTickCount();
                 ReleaseSRWLockExclusive(&g_out_lock);
             }
@@ -11334,7 +11518,13 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             char *output;
             struct tool_img img = { NULL, NULL };
             char *summary;
-            if (i < n_para) {
+            if (dup[i]) {
+                /* nothing ran, so the call line is all there is to show */
+                summary = xstrdup("");
+                output = xstrdup("[identical to an earlier call in this batch "
+                                 "— its result is already in this conversation]");
+                tool_show_call(name, summary);
+            } else if (i < n_para) {
                 /* reap the parallel read in call order: every thread was
                  * launched above, so this is a join, not a fresh start */
                 WaitForSingleObject(para[i].th, INFINITE);
@@ -11397,6 +11587,28 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 free(img.mime);
             }
             session_log_message(slog, tm);
+            /* Degenerate tool thrash: this exact call, three times in one turn.
+             * content_looping catches a model stuck repeating its own words;
+             * nothing catches it stuck repeating its own tool calls (read the
+             * region, edit, read it back, edit again) — and an ordinary turn
+             * has neither a round cap nor a token cap, only /goal does. */
+            if (!dup[i] && thrash_hit(name, calls[i].args)) {
+                out_printf("⚠ 检测到工具调用重复循环（%s ×%d），已中止本轮\r\n",
+                           name, THRASH_MAX);
+                for (size_t j = i + 1; j < n_para; j++) {
+                    if (para[j].th) {
+                        WaitForSingleObject(para[j].th, INFINITE);
+                        CloseHandle(para[j].th);
+                        para[j].th = NULL;
+                    }
+                    para_slot_free(&para[j]);
+                }
+                turn_stub_rest(cv, slog, calls, i + 1, n_calls,
+                               "(not run: this call repeated too many times in "
+                               "one turn)");
+                g_thrash_stop = 1;
+                break;
+            }
             if (InterlockedCompareExchange(&g_cancel, 0, 0)) {
                 cancelled = 1;
                 /* the assistant message holding all N tool_calls is already
@@ -11413,17 +11625,18 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                     }
                     para_slot_free(&para[j]);
                 }
-                for (size_t j = i + 1; j < n_calls; j++) {
-                    struct message *stub = conv_add(cv, "tool",
-                                    "(cancelled before this call ran)");
-                    stub->tool_call_id = xstrdup(calls[j].id);
-                    session_log_message(slog, stub);
-                }
+                turn_stub_rest(cv, slog, calls, i + 1, n_calls,
+                               "(cancelled before this call ran)");
                 break;
             }
         }
+        free(dup);
         free(para);
         stream_state_free(&st);
+        if (g_thrash_stop) {
+            rc = 1;
+            break;
+        }
         if (cancelled) {
             if (InterlockedCompareExchange(&g_steer, 0, 0)) {
                 /* enter steer out of a tool run: the new text drives
@@ -11437,6 +11650,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             break;
         }
     }
+    thrash_reset();
     if (turn_usage) {
         /* /goal's budget accounting reads these after the turn returns */
         g_last_turn_in = turn_in;
@@ -11496,7 +11710,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
      * summarizer round may not need one at all. */
     if (rc == 0 && auto_compact && prompt_now >= compact_window_tokens() / 4) {
         size_t freed = 0;
-        if (conv_stub_tool_results(cv, &freed)) {
+        if (conv_stub_tool_results(cv, &freed, 0, 0, 1)) {
             int64_t est = (int64_t)(freed / 2); /* ~1 token per 2 bytes */
             prompt_now = est < prompt_now ? prompt_now - est : 0;
         }
