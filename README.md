@@ -110,7 +110,29 @@ lists, tables, CJK and emoji widths handled).
 
 Slash commands: `/new` (fresh session), `/resume` (full-screen session picker;
 `/resume <n>` picks from the numbered list it prints when stdin is scripted),
-`/skills`, `/compact` (fold early history into a summary).
+`/goal <task>` (autonomous mode — see below), `/skills`, `/compact` (fold early
+history into a summary).
+
+## Goal mode
+
+`/goal <task>` hands one large task to the agent and lets it run without you
+re-typing "继续" between rounds. Every round is a full turn — stream, tools,
+display, session log, auto-compaction — so a goal run behaves exactly like one
+long turn; it just continues itself with a tagged nudge instead of waiting for
+keystrokes.
+
+The model ends it by prefixing its final answer with ✅. Three hard stops,
+whichever comes first: the ✅ marker, a budget, or you — Ctrl+C or any real
+message hands control straight back (a goal never overrules the human).
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `KK_GOAL_ROUNDS` | 50 | Max rounds before the budget stops the run |
+| `KK_GOAL_MINUTES` | 60 | Max wall-clock minutes |
+| `KK_GOAL_TOKENS` | 5000000 | Max cumulative in+out tokens |
+
+Each round prints the usual stats line plus a dim cumulative counter
+(`🎯 第 k/N 轮 · 累计 in+out X tokens`), so the burn is visible while it runs.
 
 Paste or drop an image path and up to 4 images ship with the message as
 base64 attachments — that needs a vision-capable model.
