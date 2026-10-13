@@ -1,32 +1,26 @@
-/* kk.c — single-file, zero-dependency, fully transparent Windows coding agent.
+/* kk.c — single-file, zero-dependency Windows coding agent (Win32 + CRT only,
+ * MSVC /std:c11). Everything is static except wmain, so the optimizer sees the
+ * whole program. Sections, in dependency order:
+ *   1 basics    buf / arena / str slices / dyn arrays
+ *   2 json      arena-backed parser (zero-copy slices) + serializers
+ *   3 utf8      decode / encode / display width (CJK + emoji)
+ *   4 terminal  console VT setup, output lock, WinHTTP transport
+ *   5 markdown  streaming renderer (append-only painter)
+ *   6 protocol  SSE framing + chat-completions delta assembly
+ *   7 tools     read / write / bash / find / grep
+ *   8 session   JSONL persistence, config, system prompt
+ *   9 ui        line editor, slash commands, AGENTS.md
+ *  10 agent     turn loop + wmain
  *
- * One C translation unit, Win32 + CRT only, MSVC /std:c11. Everything is
- * static except wmain: internal linkage gives the optimizer a whole-program
- * view and keeps the file's sections orderable by dependency.
+ * Memory rules: one growable buf type; a bump arena per model request (no
+ * frees on the streaming path); JSON parses to (ptr,len) slices into a buffer
+ * the caller keeps alive; strdup only for what outlives the turn.
  *
- * Sections (order = dependency order; keep them separated by the banners):
- *   1. basics        buf / arena / str slices / dyn arrays
- *   2. json          arena-backed parser (zero-copy slices) + serializers
- *   3. utf8          decode / encode / display width (CJK + emoji)
- *   4. terminal      console VT setup, output lock, WinHTTP transport
- *   5. markdown      single-pass streaming renderer (append-only painter)
- *   6. protocol      SSE framing + OpenAI chat-completions delta assembly
- *   7. tools         read / write / bash / find / grep
- *   8. session       JSONL persistence, config kv store, system prompt
- *   9. ui            line editor, slash commands, AGENTS.md
- *  10. agent         turn loop + wmain
- *
- * Memory rules: one growable buf type reused across frames; a bump arena per
- * model request (no frees on the streaming path); JSON parses to (offset,len)
- * slices into a buffer the caller keeps alive. strdup only for data that
- * outlives the turn (conversation history, session records).
- *
- * Display == model view: nothing the model sees is hidden from the screen and
- * vice versa. The rules the code follows are in help.md.
+ * Display == model view: nothing the model sees is hidden from the screen.
  */
 
-/* Trim windows.h: kk only uses console/process/thread/WinHTTP APIs —
- * skipping GDI, crypto, OLE, shell and winsock cuts compile time. */
+/* Trim windows.h: console/process/thread/WinHTTP only — skipping GDI, crypto,
+ * OLE, shell and winsock cuts compile time. */
 #define WIN32_LEAN_AND_MEAN
 #define NOGDI
 #define NOCRYPT
@@ -41,15 +35,14 @@
 #include <string.h>
 
 #if defined(_M_X64)
-#include <emmintrin.h> /* SSE2 is part of the x86-64 baseline, not an /arch
-                        * option; ascii_run uses it. A portable path remains. */
+#include <emmintrin.h> /* SSE2 is x86-64 baseline, not an /arch option */
 #endif
 
 /* fff.h is cbindgen output for GCC targets: neutralize GCC attributes
  * (e.g. __attribute__((deprecated(...)))) for MSVC */
 #define __attribute__(x)
-#include "fff.h" /* Rust fuzzy file finder / grep cdylib API (types only;
-                  * functions resolve through LoadLibrary at runtime) */
+#include "fff.h" /* Rust fuzzy finder/grep cdylib API (types only; functions
+                  * resolve through LoadLibrary at runtime) */
 #define KK_VERSION "0.1.0"
 
 /* ==========================================================================
@@ -155,8 +148,8 @@ struct buf {
 #define BUF_INIT \
     { 0 }
 
-/* Invariant: b->p[b->len] is always '\0' (one past the data), so callers
- * may strlen() a buf's bytes directly. reserve() sizes for the NUL too. */
+/* Invariant: b->p[b->len] is always '\0', so callers may strlen() a buf's
+ * bytes directly; reserve() sizes for the NUL too. */
 static void buf_reserve(struct buf *b, size_t extra)
 {
     if (b->len + extra + 1 <= b->cap)
@@ -193,8 +186,7 @@ static void buf_appends(struct buf *b, const char *s)
     buf_append_n(b, s, strlen(s));
 }
 
-/* Append n spaces (row indent, cell padding) in 64-byte chunks: a
- * buf_appendc per column paid a reserve check per byte. */
+/* Append n spaces (row indent, cell padding) in 64-byte chunks. */
 static void buf_append_spaces(struct buf *b, size_t n)
 {
     static const char spaces[] =
@@ -206,18 +198,13 @@ static void buf_append_spaces(struct buf *b, size_t n)
     }
 }
 
-/* Append a string literal without a runtime strlen: the "" concatenation
- * forces lit to be a literal, so sizeof carries its length. Row commits and
- * per-line emitters pay this per row. */
+/* Append a string literal without a runtime strlen (sizeof carries its
+ * length; the "" concatenation forces lit to be a literal). */
 #define buf_append_lit(b, lit) buf_append_n((b), "" lit, sizeof(lit) - 1)
 
-/* Format into b's spare capacity in ONE pass, appending. The previous shape
- * of every printf-style call asked vsnprintf for the length with a NULL sink
- * and then formatted again to write it — two full formatting passes, and the
- * read tool formats one line per file line (measured 198 ns for a 35-byte
- * line, half of it make-work). UCRT reports the would-be length even when it
- * truncated, so a small guess costs a retry and only the rare big line pays
- * two passes. */
+/* Format into b's spare capacity in ONE pass, appending. UCRT reports the
+ * would-be length even when truncated, so a small guess costs a retry and
+ * only the rare big line pays two passes. */
 static void buf_append_vf(struct buf *b, const char *fmt, va_list ap0)
 {
     for (;;) {
@@ -311,9 +298,13 @@ static char *str_dupz(struct str s)
     return xstrndup(s.p, s.n);
 }
 
-/* Bounded substring search: nd (m bytes) inside h[0..n), or NULL. */
+/* Bounded substring search: nd (m bytes) inside h[0..n), or NULL. A
+ * single-byte needle is a plain memchr — the read tool searches for '\n' on
+ * every line of every page. */
 static char *mem_find(const char *h, size_t n, const char *nd, size_t m)
 {
+    if (m == 1)
+        return (char *)memchr(h, (unsigned char)nd[0], n);
     while (n >= m) {
         const char *hit = memchr(h, nd[0], n - m + 1);
         if (!hit)
@@ -350,16 +341,12 @@ static size_t mem_count(const char *h, size_t n, const char *nd, size_t m)
 }
 
 /* Length of the printable-ASCII run at s[0..n): the first byte outside
- * [0x20,0x7F] (a control byte, or any UTF-8 lead or continuation byte) ends
- * it. Three loops ask this question — the read tool caps every line with it,
- * and both of the painter's bulk-append paths use it to decide how much of a
- * run can go out as one memcpy — so it is one function, vectorized.
+ * [0x20,0x7F] (a control byte, or any UTF-8 lead/continuation byte) ends it.
+ * The read tool caps every line with it and both painter bulk-append paths
+ * use it, so it is one function, vectorized.
  *
  * SSE2 has no unsigned byte compare, so the bounds go through saturating
- * subtracts: b >= 0x20 is (0x20 - b) == 0, and b <= 0x7F is (b - 0x7F) == 0.
- * Measured (tmp/probe7.c): 2-9.6x over the byte loop from 16 bytes up, even
- * at 16 bytes, and equal below it; validated against the byte loop for every
- * length up to 200 with a stop byte at every position (0 disagreements). */
+ * subtracts: b >= 0x20 is (0x20 - b) == 0, b <= 0x7F is (b - 0x7F) == 0. */
 static size_t ascii_run(const char *s, size_t n)
 {
     size_t i = 0;
@@ -443,10 +430,9 @@ static void arena_free(struct arena *a)
 }
 
 /* Drop every chunk (next allocation starts a fresh one). Used between SSE
- * events; anything that must survive was already copied out. Keeps the
- * head chunk when it is default-sized so the per-event reset does not
- * churn malloc/free on the streaming path (arena_alloc only ever reuses
- * the head chunk, so the tail chunks are unreachable anyway). */
+ * events; anything that must survive was already copied out. The head chunk
+ * is kept when it is default-sized so the per-event reset does not churn
+ * malloc/free on the streaming path. */
 static void arena_reset(struct arena *a)
 {
     struct arena_chunk *c = a->head;
@@ -576,44 +562,45 @@ static size_t jstr_escape(const char *s, size_t n, size_t i)
  * quotes (when out is given) and the index past the closing quote, or
  * (size_t)-1.
  *
- * Why it is windowed. Measured on this machine (tmp/probe4.c): the
- * byte-at-a-time walk costs ~2 ns/byte and memchr (AVX2 in the CRT) ~0.1, so
- * the loop only wins below ~24 bytes — keys (8-16 B) favor it by up to 1.26x,
- * while anything 128 B and up favors memchr by 10-35x. Model content and tool
- * arguments are in that second group, which is what this path spends its time
- * on. A plain "find the quote, then look for a backslash before it" re-scans
- * from the quote on every escape, which is quadratic in the escape count (same
- * probe: 8x slower than the byte loop at 8 KB), so both scans here are bounded
- * to one window: two vector passes per window, wherever the escapes are. */
+ * The first 24 bytes are always walked byte by byte: the measured crossover
+ * where memchr starts winning is ~24 bytes, and envelope keys plus short
+ * values ("stop", ids, small argument fragments) end inside it — each of them
+ * then pays zero vector calls, whose fixed cost is the whole price at these
+ * lengths. Longer strings (model content, tool arguments) fall through to
+ * memchr windows. Both scans stay inside one window, so an escape never
+ * re-scans from the quote (that is quadratic in the escape count). */
 #define JSTR_WINDOW 1024
+#define JSTR_PROBE 24
 static size_t jstr_end(const char *s, size_t n, size_t i, struct str *out)
 {
     size_t start = i;
-    for (;;) {
-        if (i >= n)
-            return (size_t)-1;
-        size_t rest = n - i;
-        if (rest <= 24) { /* the tail: two vector calls cannot pay for
-                            * themselves under the measured crossover */
-            while (i < n) {
-                unsigned char c = (unsigned char)s[i];
-                if (c == '"') {
-                    if (out) {
-                        out->p = s + start;
-                        out->n = i - start;
-                    }
-                    return i + 1;
+    while (i < n) {
+        size_t probe = n - i < JSTR_PROBE ? n - i : JSTR_PROBE;
+        size_t k = 0;
+        while (k < probe) {
+            unsigned char c = (unsigned char)s[i + k];
+            if (c == '"') {
+                if (out) {
+                    out->p = s + start;
+                    out->n = i + k - start;
                 }
-                if (c == '\\') {
-                    i = jstr_escape(s, n, i);
-                    if (i == (size_t)-1)
-                        return (size_t)-1;
-                    continue;
-                }
-                i++;
+                return i + k + 1;
             }
-            return (size_t)-1;
+            if (c == '\\') {
+                i = jstr_escape(s, n, i + k);
+                if (i == (size_t)-1)
+                    return (size_t)-1;
+                break; /* resume the probe after the escape */
+            }
+            k++;
         }
+        if (k < probe)
+            continue; /* an escape was handled */
+        if (probe < JSTR_PROBE)
+            return (size_t)-1; /* buffer exhausted: unterminated */
+        i += JSTR_PROBE;
+
+        size_t rest = n - i;
         size_t win = rest > JSTR_WINDOW ? JSTR_WINDOW : rest;
         const char *q = (const char *)memchr(s + i, '"', win);
         const char *b = (const char *)memchr(s + i, '\\',
@@ -633,6 +620,7 @@ static size_t jstr_end(const char *s, size_t n, size_t i, struct str *out)
         }
         i += win; /* nothing interesting in this window */
     }
+    return (size_t)-1;
 }
 
 /* Parse a string literal starting at the opening quote. Returns the raw
@@ -731,49 +719,59 @@ static void jdecode_str(struct str raw, struct buf *out)
 
 static struct jnode *jparse_value(struct json_parser *p);
 
+/* Span of a JSON number literal at s[i]; *is_int is clear when it carried a
+ * fraction or exponent. The end index equals the start when s[i] does not
+ * begin a number. Lenient on purpose (RFC-invalid "-", "1.", "1e" read as
+ * 0/1): model output beats strictness here, and both readers share this. */
+static size_t num_span(const char *s, size_t n, size_t i, int *is_int)
+{
+    if (i < n && s[i] == '-')
+        i++;
+    while (i < n && s[i] >= '0' && s[i] <= '9')
+        i++;
+    *is_int = 1;
+    if (i < n && s[i] == '.') {
+        *is_int = 0;
+        i++;
+        while (i < n && s[i] >= '0' && s[i] <= '9')
+            i++;
+    }
+    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+        *is_int = 0;
+        i++;
+        if (i < n && (s[i] == '+' || s[i] == '-'))
+            i++;
+        while (i < n && s[i] >= '0' && s[i] <= '9')
+            i++;
+    }
+    return i;
+}
+
+/* Convert a number literal shorter than 40 bytes exactly the way both readers
+ * do: integers through _strtoui64, anything else through strtod and a cast,
+ * anything 40 bytes or longer reading as 0. */
+static double num_convert(const char *s, size_t len, int is_int, int64_t *inum)
+{
+    *inum = 0;
+    if (len >= 40)
+        return 0;
+    char tmp[40];
+    memcpy(tmp, s, len);
+    tmp[len] = '\0';
+    double d = strtod(tmp, NULL);
+    *inum = is_int ? (int64_t)_strtoui64(tmp, NULL, 10) : (int64_t)d;
+    return d;
+}
+
 static struct jnode *jparse_number(struct json_parser *p)
 {
+    int is_int;
     size_t start = p->i;
-    if (p->i < p->n && p->s[p->i] == '-')
-        p->i++;
-    while (p->i < p->n && p->s[p->i] >= '0' && p->s[p->i] <= '9')
-        p->i++;
-    int is_int = 1;
-    if (p->i < p->n && p->s[p->i] == '.') {
-        is_int = 0;
-        p->i++;
-        while (p->i < p->n && p->s[p->i] >= '0' && p->s[p->i] <= '9')
-            p->i++;
-    }
-    if (p->i < p->n && (p->s[p->i] == 'e' || p->s[p->i] == 'E')) {
-        is_int = 0;
-        p->i++;
-        if (p->i < p->n && (p->s[p->i] == '+' || p->s[p->i] == '-'))
-            p->i++;
-        while (p->i < p->n && p->s[p->i] >= '0' && p->s[p->i] <= '9')
-            p->i++;
-    }
+    p->i = num_span(p->s, p->n, p->i, &is_int);
     if (p->i == start)
         return NULL;
-    /* ponytail: accepts RFC-8259-invalid numbers like "-", "1.", "1e" as 0/1
-     * — lenient on purpose; model output beats strictness here. Strict
-     * path = verify digit after each separator before building the node. */
     struct jnode *node = jnew(p, J_NUM);
-    size_t len = p->i - start;
-    if (len < 40) {
-        char tmp[40];
-        memcpy(tmp, p->s + start, len);
-        tmp[len] = '\0';
-        node->num = strtod(tmp, NULL);
-        if (is_int) {
-            long long v = _strtoui64(tmp, NULL, 10);
-            node->inum = (int64_t)v;
-        } else {
-            node->inum = (int64_t)node->num;
-        }
-    } else {
-        node->num = 0;
-    }
+    node->num = num_convert(p->s + start, p->i - start, is_int, &node->inum);
     return node;
 }
 
@@ -946,9 +944,9 @@ static char *jstr_or(const struct jnode *node, const char *fallback)
 static void json_escape_append(struct buf *b, const char *s, size_t n)
 {
     /* escape-free runs are copied in bulk; escapes are all 2 bytes.
-     * Session-log and request serialization push megabytes of mostly
-     * plain UTF-8 through here, so plain runs are skipped 8 bytes at a
-     * time and only escape-hitting spans walk byte by byte. */
+     * Session-log and request serialization push megabytes of mostly plain
+     * UTF-8 through here, so plain runs are skipped 8 bytes at a time and
+     * only escape-hitting spans walk byte by byte. */
     buf_reserve(b, n + 16);
     size_t start = 0, i = 0;
     while (i < n) {
@@ -962,33 +960,31 @@ static void json_escape_append(struct buf *b, const char *s, size_t n)
         }
         while (i < n) {
             unsigned char c = (unsigned char)s[i];
+            char ubuf[8];
             const char *esc;
+            size_t esclen;
             switch (c) {
-            case '"': esc = "\\\""; break;
-            case '\\': esc = "\\\\"; break;
-            case '\b': esc = "\\b"; break;
-            case '\f': esc = "\\f"; break;
-            case '\n': esc = "\\n"; break;
-            case '\r': esc = "\\r"; break;
-            case '\t': esc = "\\t"; break;
+            case '"': esc = "\\\""; esclen = 2; break;
+            case '\\': esc = "\\\\"; esclen = 2; break;
+            case '\b': esc = "\\b"; esclen = 2; break;
+            case '\f': esc = "\\f"; esclen = 2; break;
+            case '\n': esc = "\\n"; esclen = 2; break;
+            case '\r': esc = "\\r"; esclen = 2; break;
+            case '\t': esc = "\\t"; esclen = 2; break;
             default:
                 if (c >= 0x20) {
-                    i++;
+                    i++; /* plain byte inside a dirty word */
                     continue;
                 }
-                buf_append_n(b, s + start, i - start);
-                buf_appendf(b, "\\u%04x", c);
-                start = i + 1;
-                i++;
-                goto next_run;
+                esclen = (size_t)snprintf(ubuf, sizeof ubuf, "\\u%04x", c);
+                esc = ubuf;
+                break;
             }
             buf_append_n(b, s + start, i - start);
-            buf_append_n(b, esc, 2);
-            start = i + 1;
-            i++;
-            break;
+            buf_append_n(b, esc, esclen);
+            start = ++i;
+            break; /* one escape emitted: retry the 8-byte skip */
         }
-    next_run:;
     }
     buf_append_n(b, s + start, n - start);
 }
@@ -1066,11 +1062,12 @@ static size_t u8_encode(uint32_t cp, char *tmp)
     return 4;
 }
 
-/* Inclusive codepoint ranges rendered two columns wide. Covers CJK, Hangul,
- * Kana, fullwidth forms, the common emoji planes and the East Asian
- * Ambiguous blocks. MUST stay sorted by lo: u8_cp_width binary-searches it.
- * Ambiguous ranges matter for CJK terminals — under-counting them makes
- * rows overflow and the cursor desync. */
+/* Inclusive codepoint ranges rendered two columns wide: CJK, Hangul, Kana,
+ * fullwidth forms, the common emoji planes and the East Asian Ambiguous
+ * blocks (ambiguous matters — under-counting them makes rows overflow and
+ * the cursor desync). MUST stay sorted by lo: u8_cp_width binary-searches
+ * it. 0x2500-0x25FF (box drawing) stays narrow: Windows Terminal renders
+ * these 1 cell, and kk's own decorations use them. */
 static const struct {
     uint32_t lo, hi;
 } WIDE_RANGES[] = {
@@ -1213,8 +1210,8 @@ static size_t visible_width(const char *s, size_t n)
     return w;
 }
 
-/* Make a byte buffer valid UTF-8: when it isn't, transcode from the
- * console output codepage (native tools emit GBK on zh-CN machines). */
+/* Make a byte buffer valid UTF-8: when it isn't, transcode from the console
+ * output codepage (native tools emit GBK on zh-CN machines). */
 static void transcode_to_utf8(char **pdata, size_t *plen)
 {
     char *data = *pdata;
@@ -1258,6 +1255,20 @@ static int g_term_rows = 30;
 
 /* Set from the Ctrl handler; polled by transport and tool loops. */
 static volatile LONG g_cancel;
+
+/* Performance-counter frequency, read once in term_init: GetTickCount's
+ * 15.6 ms clock floor would turn the painter's 20 ms frame throttle into a
+ * 31 ms one. */
+static LARGE_INTEGER g_qpc_freq;
+
+static DWORD now_ms(void)
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (DWORD)(c.QuadPart * 1000 / (g_qpc_freq.QuadPart
+                                            ? g_qpc_freq.QuadPart
+                                            : 1));
+}
 
 static BOOL WINAPI kk_ctrl_handler(DWORD type)
 {
@@ -1316,18 +1327,18 @@ static void term_init(void)
     if (g_console_in)
         SetConsoleCP(CP_UTF8);
 
+    QueryPerformanceFrequency(&g_qpc_freq);
     SetConsoleCtrlHandler(kk_ctrl_handler, TRUE);
 }
 
-/* --- raw VT byte input (ki's scheme) ------------------------------------ */
+/* --- raw VT byte input --------------------------------------------------- */
 
 /* Input is read as the terminal's raw VT byte stream (ReadFile +
- * ENABLE_VIRTUAL_TERMINAL_INPUT), never as INPUT_RECORDs: conhost's
- * key translator mangles bracketed-paste markers and Alt chords, which
- * is why multi-line paste never survived the console API. Three
- * consumers share the byte layer — the composer editor, the turn-time
- * input reader and the session picker — and each brackets its own
- * window with term_raw_begin/term_raw_end (they never overlap). */
+ * ENABLE_VIRTUAL_TERMINAL_INPUT), never as INPUT_RECORDs: conhost's key
+ * translator mangles bracketed-paste markers and Alt chords. Three consumers
+ * share the byte layer — composer editor, turn-time input reader, session
+ * picker — each bracketed by term_raw_begin/term_raw_end (never overlapping).
+ */
 #define VT_INPUT_FLAG 0x0200 /* ENABLE_VIRTUAL_TERMINAL_INPUT */
 
 static BOOL term_raw_begin(DWORD *saved)
@@ -1346,18 +1357,15 @@ static void term_raw_end(DWORD saved)
     SetConsoleMode(g_hstdin, saved);
 }
 
-/* The consumers never overlap, so one shared read buffer serves them:
- * pastes arrive in multi-KB bursts and 1-byte ReadFile calls made
- * pasting visibly slow (one conhost round-trip per byte of the paste). */
+/* One shared read buffer (the consumers never overlap): pastes arrive in
+ * multi-KB bursts and 1-byte ReadFile calls made pasting visibly slow. */
 static unsigned char term_in[4096];
 static size_t term_in_len, term_in_pos;
 
-/* Console handles signal when an input record is queued; bounded wait
- * gives the escape parser its inter-byte timeout. Bytes already pulled
- * into term_in by an earlier chunk read count as readable: the console
- * signal only covers its own queue, and blocking while a multi-byte
- * chunk sits buffered meters input out one keystroke at a time (the
- * IME phrase commit showed one character per keypress). */
+/* Console handles signal when an input record is queued; bounded wait gives
+ * the escape parser its inter-byte timeout. Bytes already pulled into term_in
+ * count as readable: blocking while a multi-byte chunk sits buffered meters
+ * input out one keystroke at a time. */
 static BOOL term_wait_readable(int timeout_ms)
 {
     if (term_in_pos < term_in_len)
@@ -1415,15 +1423,14 @@ static unsigned char csi_read(char *params, size_t cap, size_t *np)
 
 /* All terminal/pipe output funnels through here. UTF-8 in, bytes out;
  * console writes go through WriteConsoleA (honors the VT state and the
- * UTF-8 output codepage), redirect writes through WriteFile. The lock
- * keeps the wait-spinner thread from interleaving with stream paint. */
+ * UTF-8 output codepage), redirect writes through WriteFile. The lock keeps
+ * the wait-spinner thread from interleaving with stream paint. */
 static SRWLOCK g_out_lock = SRWLOCK_INIT;
 static volatile LONG g_busy;    /* 0 idle, 1 waiting, 2 generating */
 static int g_dock;              /* REPL dock active: pin composer during turns */
-/* Shared with the spinner thread: g_status_model is only ever written
- * while no turn runs (cmd_slash executes idle), g_ctx_tokens updates
- * mid-turn are x64-aligned 64-bit stores the spinner may read a frame
- * stale — both are benign by construction. */
+/* Shared with the spinner thread: g_status_model is only written while no
+ * turn runs, and g_ctx_tokens updates are x64-aligned 64-bit stores the
+ * spinner may read a frame stale — both benign by construction. */
 static char *g_status_model; /* own copy: the model name for the status row */
 static int64_t g_ctx_tokens; /* last API-reported prompt tokens (0=unknown) */
 
@@ -1457,8 +1464,7 @@ static void out_write_unlocked(const char *s, size_t n)
 static SHORT g_content_x, g_content_y; /* buffer coords, -1 = unset */
 static int g_no_seek; /* full-screen overlays (session picker) write raw */
 static int g_region_bottom = -1; /* viewport row of the scroll region's
-                                  * bottom (= panel top - 1); the region
-                                  * tracks the panel's actual height */
+                                  * bottom (= panel top - 1) */
 
 /* Seek to the tracked content end and re-track after a write. Lock held. */
 static void content_seek_write(const char *s, size_t n)
@@ -1478,8 +1484,7 @@ static void content_seek_write(const char *s, size_t n)
         /* chat-style bottom alignment: when the transcript ends above the
          * region bottom, scroll the region down so output hugs the panel
          * and the spare rows live at the top (future scrollback). Once
-         * aligned the region scrolls normally and the gap stays zero. */
-        int rbottom = csbi.srWindow.Top + g_region_bottom - 1;
+         * aligned the region scrolls normally and the gap stays zero. */        int rbottom = csbi.srWindow.Top + g_region_bottom - 1;
         int gap = rbottom - g_content_y;
         if (gap > 0) {
             if (gap > g_region_bottom)
@@ -1572,10 +1577,9 @@ static void out_printf_thread_end(void)
     }
 }
 
-/* Fixed dock (ki's interaction mode): rows 1..N-2 scroll the transcript
- * (DECSTBM), row N-1 is the composer bar, row N the status line. Both
- * pinned rows keep their owner for the whole session, so the input bar
- * is always visible and always usable — even mid-turn. */
+/* Fixed dock: rows 1..N-2 scroll the transcript (DECSTBM), row N-1 is the
+ * composer bar, row N the status line. Both pinned rows keep their owner for
+ * the whole session, so the input bar is always visible — even mid-turn. */
 
 /* Turn clock and streamed-byte counter behind the status rows. */
 static DWORD g_turn_start;    /* GetTickCount at turn start */
@@ -1637,7 +1641,7 @@ static const char *SPIN_FRAMES[] = { "⠋", "⠙", "⠹", "⠸", "⠼",
  * streams on the agent thread. Text submitted mid-turn is queued here:
  * Enter sets g_steer + g_cancel, the run unwinds, and turn_feed_queue
  * injects the text as the user turn the next request answers. All
- * queued state is guarded by g_out_lock. */
+ * state is guarded by g_out_lock. */
 
 static struct buf g_queued;           /* pending new-input lines, \n separated */
 static volatile LONG g_steer;         /* enter with content: inject + interrupt */
@@ -1651,16 +1655,16 @@ static char g_gen_tool[48];
 static size_t g_gen_len, g_gen_lines;
 
 /* Fixed dock: the composer panel pins to the bottom edge (rule + draft
- * window + hint + rule + status, 4..13 rows tall) and every painter
- * writes absolute rows; the scroll region ends above the tallest panel
- * so transcript output scrolls behind it and the panel never vanishes. */
+ * window + hint + rule + status, 4..13 rows tall) and every painter writes
+ * absolute rows; the scroll region ends above the tallest panel so
+ * transcript output scrolls behind it and the panel never vanishes. */
 static volatile LONG g_frame; /* spinner animation frame */
 static struct buf g_dock_frame;
 
 /* Build the pinned status row's text: spinner + phase during waits and
- * streaming, the running tool's label, the model name when idle. Both
- * the spinner thread and the composer frame render through this, so a
- * keystroke repaint never flickers the row back to the model name. */
+ * streaming, the running tool's label, the model name when idle. Both the
+ * spinner thread and the composer frame render through this, so a keystroke
+ * repaint never flickers the row back to the model name. */
 static void status_line_build(char *line, size_t lcap, char *tail,
                               size_t tcap)
 {
@@ -1726,21 +1730,21 @@ static void status_line_build(char *line, size_t lcap, char *tail,
 /* args holds the whole accumulated buffer; from is where this delta began,
  * so line counting stays O(new bytes) instead of rescanning per delta.
  *
- * Counters only, on purpose. This used to format the status label right here,
- * which cost two snprintf plus an output-lock acquire on every argument
- * delta: 20,000 times for a 1.4MB streamed file write, against a row the
- * spinner repaints ~11 times a second — measured as ~10 ms of the 18.7 ms
- * assembly cost for that stream. status_line_build turns these numbers into
- * text once per frame that is actually drawn. The spinner may read them one
- * frame stale, the same benign class as g_ctx_tokens: a byte count 90 ms
- * behind is still the right number to show. */
+ * Counters only, on purpose: the row formats them at paint time. Formatting
+ * here instead cost two snprintf plus an output-lock acquire on every
+ * argument delta — 20,000 times for a 1.4MB streamed file write. */
 static void gen_progress(const char *tool, const struct buf *args, size_t from)
 {
     if (g_gen_len == 0 && g_gen_lines == 0 && args->len > from)
         g_tick_start = GetTickCount(); /* first fragment: start the clock */
-    for (const char *p = args->p + from; p < args->p + args->len; p++)
-        if (*p == '\n')
-            g_gen_lines++;
+    const char *p = args->p + from, *end = args->p + args->len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        if (!nl)
+            break;
+        g_gen_lines++;
+        p = nl + 1;
+    }
     g_gen_len += args->len - from;
     if (!g_gen_tool[0] && tool && *tool)
         snprintf(g_gen_tool, sizeof g_gen_tool, "%s", tool);
@@ -1774,10 +1778,10 @@ static void status_repaint(void)
     ReleaseSRWLockExclusive(&g_out_lock);
 }
 
-/* pi's user-message echo: the text wraps at the terminal width and every
- * visual row pads its deep-teal background out to the full width. The
- * bar stops one column short of the last column so no row trips the
- * terminal's pending-wrap state. */
+/* User-message echo: the text wraps at the terminal width and every visual
+ * row pads its deep-teal background out to the full width. The bar stops
+ * one column short of the last column so no row trips the terminal's
+ * pending-wrap state. */
 static void user_bars_buf(struct buf *out, const char *text, size_t len)
 {
     size_t cols = (size_t)g_term_cols;
@@ -1835,18 +1839,15 @@ static void user_line_show(const char *text, size_t n)
     }
 }
 
-/* Nap for about ms, with two things Sleep cannot give on this machine: a wake
- * at the millisecond asked for, and a wait somebody can cut short. Sleep's
- * floor here is one clock tick — measured: Sleep(10) sleeps 16.1 ms and
- * Sleep(1) also 16.1 ms — so anything polled on it notices finished work a
- * tick late (a finished bash call cost 16 ms of that, the spinner below could
- * only be reaped ~33 ms after a turn ended). A high-resolution waitable timer
- * (Win10 1607+; the manifest already requires 1903) is per-object, so it does
- * not raise the clock resolution for every other process, and `wake` is
- * waited on alongside it so an owner can end the nap at once. Per thread,
- * because two threads arming one timer would cut each other short. The Sleep
- * fallback costs a tick and nothing more: both callers nap only until work
- * appears. */
+/* Nap for about ms, with two things Sleep cannot give on this machine: a
+ * wake at the millisecond asked for, and a wait somebody can cut short.
+ * Sleep's floor here is one clock tick (measured: Sleep(10) sleeps 16.1 ms),
+ * so anything polled on it notices finished work a tick late. A
+ * high-resolution waitable timer (Win10 1607+; the manifest already requires
+ * 1903) is per-object, so it does not raise the clock resolution for every
+ * other process, and `wake` is waited on alongside it so an owner can end
+ * the nap at once. Per thread, because two threads arming one timer would
+ * cut each other short. The Sleep fallback costs a tick and nothing more. */
 static _Thread_local HANDLE g_nap_timer;
 
 static void kk_nap(DWORD ms, HANDLE wake)
@@ -1889,10 +1890,9 @@ static void nap_thread_end(void)
     }
 }
 
-/* Wait spinner: the sole animator of the pinned status line, running
- * for the whole turn (wait, stream, tools) — the row belongs to it, so
- * nothing can fight it for pixels. Never paints without VT (pipes stay
- * clean for scripted use). */
+/* Wait spinner: the sole animator of the pinned status line, running for the
+ * whole turn (wait, stream, tools) — the row belongs to it, so nothing can
+ * fight it for pixels. Never paints without VT (pipes stay clean). */
 
 /* Set by the turn-end path so the spinner stops napping out its frame before
  * it is joined: that nap was the gap between an answer ending and the
@@ -1953,8 +1953,8 @@ typedef int (*http_stream_cb)(const char *bytes, size_t n, void *user);
 
 /* The session and connection are cached process-wide: WinHTTP pools
  * keep-alive connections per session, so reusing them skips the TCP+TLS
- * handshake on every model turn — and a tool loop makes several requests
- * per user turn. HTTP only runs on the agent thread, so no lock. */
+ * handshake on every model turn — and a tool loop makes several requests per
+ * user turn. HTTP only runs on the agent thread, so no lock. */
 static HINTERNET g_http_session;
 static HINTERNET g_http_connect;
 static char *g_http_host;      /* cache key: narrow host + port + scheme */
@@ -2173,8 +2173,8 @@ static int http_post_stream(const char *url, const char *auth_key,
         }
         if (avail == 0)
             break;
-        char tmp[65536]; /* 64KB per read: a 2MB stream pays 32 read
-                          * round-trips instead of 128 */
+        char tmp[262144]; /* 256KB per read: a 2MB stream pays 8 read
+                           * round-trips instead of 128 */
         DWORD read = 0;
         if (avail > sizeof tmp)
             avail = sizeof tmp;
@@ -2238,12 +2238,11 @@ out:
  * CRLF and never touched again (native scrollback stays intact). Only the
  * pending (last, unterminated) row is repainted in place with CR + ESC[K.
  * Rows hard-wrap at the usable width, so a late delta can never change an
- * already-committed row. Code fences are hard-wrapped too (spaces
- * preserved) and are line-buffered so the closing fence can be recognized
- * before anything is emitted. GFM tables are line-buffered the same way
- * (layout adapted from hax): the complete
- * block renders as an aligned grid, reflows into records when too wide,
- * or falls back to a verbatim render when a cell holds a literal `|`.
+ * already-committed row. Code fences are hard-wrapped too (spaces preserved)
+ * and are line-buffered so the closing fence can be recognized before
+ * anything is emitted. GFM tables are line-buffered the same way: the
+ * complete block renders as an aligned grid, reflows into records when too
+ * wide, or falls back to a verbatim render when a cell holds a literal `|`.
  */
 
 #define PREFIX_THINK "\x1b[2m▍ \x1b[0m"
@@ -2261,8 +2260,8 @@ struct inline_state {
 };
 
 /* Compose one SGR sequence for a style set; the channel's base flags are
- * re-applied after the reset. seq must hold >=56 bytes. Built byte by
- * byte: the printf round-trip ran on every style toggle. */
+ * re-applied after the reset. seq must hold >=56 bytes. Built byte by byte:
+ * the printf round-trip ran on every style toggle. */
 static void compose_sgr(char *seq, size_t cap, const char *base_flags,
                         const struct inline_state *st)
 {
@@ -2338,9 +2337,9 @@ static void painter_init(struct painter *p, const char *base_flags,
 }
 
 /* Recompute usable columns. Runs on width changes and at every row start:
- * quote/code prefixes are swapped at runtime, and a row that does not
- * count its prefix overflows the terminal — the early auto-wrap then
- * desyncs the painter and the cursor jumps rows. */
+ * quote/code prefixes are swapped at runtime, and a row that does not count
+ * its prefix overflows the terminal — the early auto-wrap then desyncs the
+ * painter and the cursor jumps rows. */
 static void painter_layout(struct painter *p)
 {
     p->usable = p->cols - 1 - p->prefix_cols;
@@ -2421,7 +2420,7 @@ static void painter_screen(struct painter *p);
 
 static void painter_screen_throttled(struct painter *p)
 {
-    DWORD now = GetTickCount();
+    DWORD now = now_ms();
     if (now - g_last_paint < 20)
         return; /* still buffered; the next delta or commit will paint */
     g_last_paint = now;
@@ -2995,7 +2994,7 @@ static void rd_fence_char(struct renderer *r, uint32_t c)
     buf_append_cp(&r->fence_line, c);
 }
 
-/* --- GFM tables (collector + layout adapted from hax's markdown_table) ---
+/* --- GFM tables ------------------------------------------------------------
  * Rows buffer whole because column sizing needs the complete block. A table
  * opens only when a header row is followed by a `:?-+:?` delimiter row with
  * matching column count. Aligned grids are emitted when the natural width
@@ -3103,11 +3102,9 @@ static void tbl_cell_sgr(struct buf *out, const struct inline_state *st,
 }
 
 /* Render one cell's inline markers (**bold**, *em*, `code`, ~~strike~~) into
- * styled bytes. Full lookahead, cached: each codepoint is decoded exactly
- * once and slides into `cp` on the next iteration — the old form decoded
- * every codepoint twice (once as cp, once as the next iteration's
- * lookahead). next == 0 means "no byte after this one", which the
- * boundary checks rely on. */
+ * styled bytes. Full lookahead, cached: each codepoint is decoded exactly once
+ * and slides into `cp` on the next iteration. next == 0 means "no byte after
+ * this one", which the boundary checks rely on. */
 static void tbl_cell_styled(struct buf *out, const char *s, size_t n, int bold_base)
 {
     struct inline_state st = { 0, 0, 0, 0, 0 };
@@ -3934,8 +3931,8 @@ static void sse_data_add(struct sse_parser *sp, const char *d, size_t dn,
  * gathered with memchr in one pass — no per-byte buffer appends. A line whole
  * inside the chunk is parsed where it lies; only a line split across two
  * chunks is copied into sp->line, and only a multi-line event accumulates in
- * sp->data. The common OpenAI event (one data line, blank line, same chunk)
- * costs zero copies between the socket and the delta scanner. */
+ * sp->data, so the common OpenAI event costs zero copies between the socket
+ * and the delta scanner. */
 static void sse_feed(struct sse_parser *sp, const char *bytes, size_t n,
                      sse_data_cb cb, void *user)
 {
@@ -4073,20 +4070,19 @@ struct chat_request {
 
 /* --- the delta fast scan -------------------------------------------------- */
 /* An SSE delta is a fixed envelope, and paying a DOM for it is the most
- * expensive thing kk does per streamed byte. Measured on a 21,627-event,
- * 4.4MB stream: building the tree costs 878 ns/event (222 MB/s) while the
- * framing that copies every byte runs at 5.7 GB/s, and the tree is 90% of the
- * protocol path's total. About 21 arena nodes — 64 bytes each, zeroed on
- * allocation — exist only so jobj_get can reach "content".
+ * expensive thing kk does per streamed byte: on a 21,627-event, 4.4MB stream
+ * the tree cost 878 ns/event (222 MB/s) against 5.7 GB/s for the framing —
+ * 90% of the protocol path. About 21 arena nodes exist only so jobj_get can
+ * reach "content".
  *
  * The scan below walks the envelope by index and allocates nothing: the keys
  * the stream uses become slices into the caller's buffer, every other member
  * is skipped structurally. Wherever it is not certain — an unexpected value
  * type, an "error" member, a populated "usage", more than FAST_CALLS calls in
  * one event, malformed bytes — it returns 0 and the general parser handles
- * the event. The DOM path therefore stays the definition of the protocol; the
- * fast scan only ever has to match it, never replace it. Both then feed the
- * same three appliers below, so nothing is implemented twice. */
+ * the event. The DOM path stays the definition of the protocol; the fast
+ * scan only ever has to match it. Both feed the same three appliers below,
+ * so nothing is implemented twice. */
 #define FAST_CALLS 4
 
 struct call_delta {
@@ -4131,43 +4127,16 @@ static size_t jw_str(const char *s, size_t n, size_t i, struct str *out)
     return jstr_end(s, n, i + 1, out);
 }
 
-/* A number literal: the same conversion jparse_number applies (integer
- * literals through _strtoui64, anything else through strtod and a cast,
- * anything 40 bytes or longer reading as 0). */
+/* A number literal, converted exactly as jparse_number does. */
 static int jw_num(const char *s, size_t n, size_t i, int64_t *out,
                   size_t *after)
 {
+    int is_int;
     size_t start = i;
-    if (i < n && s[i] == '-')
-        i++;
-    while (i < n && s[i] >= '0' && s[i] <= '9')
-        i++;
-    int is_int = 1;
-    if (i < n && s[i] == '.') {
-        is_int = 0;
-        i++;
-        while (i < n && s[i] >= '0' && s[i] <= '9')
-            i++;
-    }
-    if (i < n && (s[i] == 'e' || s[i] == 'E')) {
-        is_int = 0;
-        i++;
-        if (i < n && (s[i] == '+' || s[i] == '-'))
-            i++;
-        while (i < n && s[i] >= '0' && s[i] <= '9')
-            i++;
-    }
+    i = num_span(s, n, i, &is_int);
     if (i == start)
         return 0;
-    size_t len = i - start;
-    *out = 0;
-    if (len < 40) {
-        char tmp[40];
-        memcpy(tmp, s + start, len);
-        tmp[len] = '\0';
-        *out = is_int ? (int64_t)_strtoui64(tmp, NULL, 10)
-                      : (int64_t)strtod(tmp, NULL);
-    }
+    num_convert(s + start, i - start, is_int, out);
     *after = i;
     return 1;
 }
@@ -4629,10 +4598,6 @@ static void stream_apply_hit(struct stream_state *st,
         stream_apply_call(st, &h->calls[k]);
 }
 
-/* Set only by the differential probe in tmp/bench.c, which runs every event
- * through both paths and compares the assembled result. */
-static int g_delta_fast_off;
-
 /* One SSE data payload: parse and fold into state + hooks. Decoded deltas
  * go straight into their owning buffers — the hooks render from the
  * appended range, so no scratch copy per delta is needed. */
@@ -4648,7 +4613,7 @@ static void stream_handle_data(struct str data, void *user)
     }
 
     struct delta_hit dh;
-    if (!g_delta_fast_off && delta_fast_scan(data.p, data.n, &dh)) {
+    if (delta_fast_scan(data.p, data.n, &dh)) {
         stream_apply_hit(st, &cr->hooks, &dh);
         return;
     }
@@ -4758,11 +4723,11 @@ static void stream_handle_data(struct str data, void *user)
 }
 
 /* Transport bytes -> SSE events -> delta assembly. */
-/* A model that falls into a degenerate loop emits the same span over and
- * over: one captured run produced 757,988 characters that were 98% one
- * repeated sentence. Demand that the newest block has already turned up
- * twice in the recent window, so legitimate repetition (a markdown table,
- * a progress log) cannot trip it. */
+/* A model that falls into a degenerate loop emits the same span over and over:
+ * one captured run produced 757,988 characters that were 98% one repeated
+ * sentence. Demand that the newest block has already turned up twice in the
+ * recent window, so legitimate repetition (a markdown table, a progress log)
+ * cannot trip it. */
 #define LOOP_BLK 64
 #define LOOP_WIN 8192
 static int content_looping(const struct buf *b)
@@ -5270,24 +5235,41 @@ static wchar_t *path_to_w(struct str path)
 #define FILE_READ_CAP (4 * 1024 * 1024)
 #define SESSION_READ_CAP (64 * 1024 * 1024)
 
-/* cap exists to keep tool reads from malloc-ing monsters; session
- * replay needs the higher bound — a long-lived session that crosses
- * 4MB must still be continuable */
-static char *file_read_all_up_to(struct str path, size_t *out_len,
-                                 long long cap)
+/* The one file reader every consumer shares. cap>0 refuses bigger files
+ * (reporting the size through *too_big_at when given) and keeps tool reads
+ * from malloc-ing monsters — session replay passes SESSION_READ_CAP for the
+ * higher bound; head>0 reads at most that many bytes whatever the size.
+ * share=0 doubles as the lock probe: an exclusive open fails with
+ * ERROR_SHARING_VIOLATION exactly when another process holds the file. */
+static char *file_slurp(struct str path, size_t *out_len, int *locked,
+                        unsigned long long *too_big_at, long long cap,
+                        size_t head)
 {
     wchar_t *w = path_to_w(path);
-    HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD share = locked ? 0 : (FILE_SHARE_READ | FILE_SHARE_WRITE);
+    HANDLE f = CreateFileW(w, GENERIC_READ, share, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
     free(w);
-    if (f == INVALID_HANDLE_VALUE)
+    if (locked)
+        *locked = 0;
+    if (f == INVALID_HANDLE_VALUE) {
+        if (locked && GetLastError() == ERROR_SHARING_VIOLATION)
+            *locked = 1;
         return NULL;
+    }
     LARGE_INTEGER sz;
-    if (!GetFileSizeEx(f, &sz) || sz.QuadPart > cap) {
+    int sized = GetFileSizeEx(f, &sz) != 0;
+    if (!sized || (cap && sz.QuadPart > cap)) {
+        if (too_big_at)
+            *too_big_at = sized && cap && sz.QuadPart > cap
+                              ? (unsigned long long)sz.QuadPart
+                              : 0;
         CloseHandle(f);
         return NULL;
     }
     size_t n = (size_t)sz.QuadPart;
+    if (head && n > head)
+        n = head;
     char *data = xmalloc(n + 1);
     DWORD got = 0;
     ReadFile(f, data, (DWORD)n, &got, NULL);
@@ -5299,27 +5281,15 @@ static char *file_read_all_up_to(struct str path, size_t *out_len,
 
 static char *file_read_all(struct str path, size_t *out_len)
 {
-    return file_read_all_up_to(path, out_len, FILE_READ_CAP);
+    return file_slurp(path, out_len, NULL, NULL, FILE_READ_CAP, 0);
 }
 
-/* The first cap bytes whatever the file size — file_read_all_up_to refuses
- * anything larger instead of truncating, and a SKILL.md body runs to 17KB
- * while only its frontmatter is of interest. */
+/* The first cap bytes whatever the file size — file_slurp refuses anything
+ * larger instead of truncating, and a SKILL.md body runs to 17KB while only
+ * its frontmatter is of interest. */
 static char *file_read_head(struct str path, size_t cap, size_t *out_len)
 {
-    wchar_t *w = path_to_w(path);
-    HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(w);
-    if (f == INVALID_HANDLE_VALUE)
-        return NULL;
-    char *data = xmalloc(cap + 1);
-    DWORD got = 0;
-    ReadFile(f, data, (DWORD)cap, &got, NULL);
-    CloseHandle(f);
-    data[got] = '\0';
-    *out_len = got;
-    return data;
+    return file_slurp(path, out_len, NULL, NULL, 0, cap);
 }
 
 static int file_write_all(struct str path, const char *data, size_t n)
@@ -6173,44 +6143,13 @@ static size_t read_line_prefix(char *dst, size_t line_no)
  * holding it. dwShareMode 0 *is* the lock test: if the open succeeds nobody
  * else has the file, and ERROR_SHARING_VIOLATION means they do — so the read
  * path stops paying a second CreateFileW to learn what the first already
- * proved. Measured: that extra open cost ~0.2 ms on every read call, more than
- * reading and transcoding the file took. The one deliberate difference from
- * the old two-open order: a file held exclusively now reports "locked" instead
- * of "cannot read", which is the truer message. */
+ * proved. The one deliberate difference from the old two-open order: a file
+ * held exclusively now reports "locked" instead of "cannot read", which is
+ * the truer message. */
 static char *file_read_excl(struct str path, size_t *out_len, int *locked,
                             unsigned long long *too_big_at)
 {
-    wchar_t *w = path_to_w(path);
-    HANDLE f = CreateFileW(w, GENERIC_READ, 0, NULL, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    free(w);
-    *locked = 0;
-    if (f == INVALID_HANDLE_VALUE) {
-        if (GetLastError() == ERROR_SHARING_VIOLATION)
-            *locked = 1;
-        return NULL;
-    }
-    LARGE_INTEGER sz;
-    /* the same ceiling file_read_all enforced, held here rather than left to
-     * a separate attribute probe: a file that grows between the two would
-     * otherwise be malloc'd whole — and the probe cost a syscall per read */
-    int sized = GetFileSizeEx(f, &sz) != 0;
-    if (!sized || sz.QuadPart > FILE_READ_CAP) {
-        if (too_big_at)
-            *too_big_at = sized && sz.QuadPart > FILE_READ_CAP
-                              ? (unsigned long long)sz.QuadPart
-                              : 0;
-        CloseHandle(f);
-        return NULL;
-    }
-    size_t n = (size_t)sz.QuadPart;
-    char *data = xmalloc(n + 1);
-    DWORD got = 0;
-    ReadFile(f, data, (DWORD)n, &got, NULL);
-    CloseHandle(f);
-    data[got] = '\0';
-    *out_len = got;
-    return data;
+    return file_slurp(path, out_len, locked, too_big_at, FILE_READ_CAP, 0);
 }
 
 static char *tool_read(const struct jnode *args, struct tool_img *img)
@@ -6518,15 +6457,13 @@ static char *b64_encode(const char *data, size_t n)
 
 /* --- persistent PowerShell session ---------------------------------------- */
 
-/* One PowerShell process serves every bash call: it reads one base64
- * line per call ("guid\ncommand"), invokes it, and answers with a
- * per-call completion marker "<<<KK-DONE:guid:exit>>>". This skips the
- * ~1.1s process start each per-call spawn paid, and lets the working
- * directory and environment carry over, like a developer's own shell.
- * The spawn is prewarmed on a background thread at startup; g_ps_lock
- * arbitrates that spawn against the first tool call reaching shell_run.
- * The tool call itself is synchronous and runs on the agent thread
- * only, so the main thread simply polls the pipe. */
+/* One PowerShell process serves every bash call: it reads one base64 line per
+ * call ("guid\ncommand"), invokes it, and answers with a per-call completion
+ * marker "<<<KK-DONE:guid:exit>>>". This skips the ~1.1s process start each
+ * per-call spawn paid, and lets the working directory and environment carry
+ * over. The spawn is prewarmed on a background thread at startup; g_ps_lock
+ * arbitrates that spawn against the first tool call reaching shell_run. The
+ * call itself is synchronous and runs on the agent thread only. */
 
 static HANDLE g_ps_process; /* the long-lived powershell.exe */
 static HANDLE g_ps_job;     /* KILL_ON_JOB_CLOSE sweeps the whole tree */
@@ -6535,21 +6472,6 @@ static HANDLE g_ps_out_r;   /* merged stdout+stderr of the session */
 static char g_ps_guid[16];  /* marker id of the call in flight */
 static unsigned g_ps_seq;
 static SRWLOCK g_ps_lock = SRWLOCK_INIT;
-
-static int ps_find_marker(struct buf *b, size_t from, const char *pre,
-                          size_t plen, size_t *at)
-{
-    if (!b->p || b->len < plen)
-        return 0;
-    if (from + plen > b->len)
-        from = b->len > plen ? b->len - plen : 0;
-    for (size_t i = from; i + plen <= b->len; i++)
-        if (memcmp(b->p + i, pre, plen) == 0) {
-            *at = i;
-            return 1;
-        }
-    return 0;
-}
 
 /* Kill the session: the tree dies with the job, a fresh shell serves
  * the next call. */
@@ -6599,22 +6521,18 @@ static DWORD WINAPI ps_prewarm(LPVOID arg)
 
 static int ps_spawn(void)
 {
-    /* the loop protocol: one base64("guid\ncommand") line in, command
-     * output plus a marker line out. Base64 keeps every command
-     * quote-safe, exactly like -EncodedCommand does. 6>&1 folds the
-     * information stream (Write-Host et al.) back into the pipeline:
-     * with piped handles and no console, PS serializes host writes as
-     * CLIXML XML on stderr instead of plain text. EAP=Stop routes
-     * cmdlet errors into the catch as plain text — the redirected
-     * error stream would otherwise serialize as CLIXML and flush
-     * lazily across calls. The output AND the marker go through
-     * [Console]::Out with an explicit flush, NOT through Write-Output:
-     * the host's redirected-output writer holds formatted output
-     * indefinitely — a command's marker then only reaches the pipe
-     * when the NEXT command arrives, deadlocking the wait-for-marker
-     * protocol on every quiet command. [Console]::Out (with
-     * Out-String -Stream routing pipeline output line by line) writes
-     * straight to the handle. */
+    /* The loop protocol: one base64("guid\ncommand") line in, command output
+     * plus a marker line out. Base64 keeps every command quote-safe, exactly
+     * like -EncodedCommand does. 6>&1 folds the information stream
+     * (Write-Host et al.) back into the pipeline: with piped handles and no
+     * console, PS serializes host writes as CLIXML XML on stderr instead of
+     * plain text. EAP=Stop routes cmdlet errors into the catch as plain text
+     * — the redirected error stream would otherwise serialize as CLIXML and
+     * flush lazily across calls. The output AND the marker go through
+     * [Console]::Out with an explicit flush, NOT through Write-Output: the
+     * host's redirected-output writer holds formatted output indefinitely, so
+     * a quiet command's marker would only reach the pipe when the NEXT
+     * command arrives, deadlocking the wait-for-marker protocol. */
     static const char *loop =
         "$ProgressPreference = 'SilentlyContinue'\n"
         "$ErrorActionPreference = 'Stop'\n"
@@ -6716,23 +6634,18 @@ done:
 
 /* --- CLIXML fallback ------------------------------------------------------ */
 
-/* Windows PowerShell serializes host-class output (cmdlet errors,
- * Write-Host inside a nested powershell.exe) as `#< CLIXML` + an <Objs>
- * document on the merged pipe — with 6>&1 folding the info stream, a
- * cmdlet error exists ONLY in this form. Recover the Error/Message text
- * so the model reads sentences, not markup; the decoded text replaces
- * the document, so model and screen see the same thing. */
+/* Windows PowerShell serializes host-class output (cmdlet errors, Write-Host
+ * inside a nested powershell.exe) as `#< CLIXML` + an <Objs> document on the
+ * merged pipe — with 6>&1 folding the info stream, a cmdlet error exists ONLY
+ * in this form. Recover the Error/Message text so the model reads sentences,
+ * not markup; the decoded text replaces the document, so model and screen see
+ * the same thing. */
 
+/* Four hex digits, or -1. The JSON layer already has this reader. */
 static int hex4(const char *s)
 {
-    int v = 0;
-    for (int k = 0; k < 4; k++) {
-        int h = jhex(s[k]);
-        if (h < 0)
-            return -1;
-        v = v * 16 + h;
-    }
-    return v;
+    size_t i = 0;
+    return jhex_quad(s, 4, &i);
 }
 
 /* Decode one record's inner text: PowerShell's private-use _xHHHH_
@@ -6885,13 +6798,12 @@ static int shell_run(struct str command,
         }
         struct buf out = BUF_INIT;
 
-        /* read until the marker, EOF, or the deadline; output of the
-         * call and of the trailing marker line interleave in one pipe.
-         * scan_from resumes the marker search after each chunk (the
-         * prefix may straddle a boundary), keeping big outputs linear.
-         * The deadline sits at the loop TOP: a command that streams
-         * forever (ping -t, a dev server) must also time out, not just
-         * one that sits silent. */
+        /* Read until the marker, EOF, or the deadline; the call's output and
+         * the trailing marker line interleave in one pipe. scan_from resumes
+         * the marker search after each chunk (the prefix may straddle a
+         * boundary), keeping big outputs linear. The deadline sits at the
+         * loop TOP: a command that streams forever (ping -t, a dev server)
+         * must also time out, not just one that sits silent. */
         size_t at = 0, scan_from = 0;
         /* the marker prefix is stable for this call: build it once, not per
          * pipe chunk */
@@ -6928,20 +6840,22 @@ static int shell_run(struct str command,
                     dead = 1; /* refuse unbounded output */
                     break;
                 }
-                if (ps_find_marker(&out, scan_from, pre, plen, &at)) {
+                char *hit = mem_find(out.p + scan_from, out.len - scan_from,
+                                     pre, plen);
+                if (hit) {
+                    at = (size_t)(hit - out.p);
                     have_marker = 1;
                     break;
                 }
                 scan_from = out.len > plen ? out.len - (plen - 1) : 0;
                 continue;
             }
-            /* the status line (spinner thread) shows the tool label and
-             * elapsed time; the poll loop here only watches the pipe.
-             * Back off after ~100 ms: a command that produces nothing for a
-             * second costs ~7x the CPU at a flat 2 ms cadence that it does no
-             * good in (measured 66M against 10M cycles for one quiet second).
-             * Forty 2 ms polls cover the calls that answer quickly; anything
-             * still silent after that is polled at 10 ms. */
+            /* The status line (spinner thread) shows the tool label and
+             * elapsed time; the poll loop here only watches the pipe. Back off
+             * after ~100 ms: a flat 2 ms cadence costs ~7x the CPU on a
+             * command that produces nothing for a second. Forty 2 ms polls
+             * cover the calls that answer quickly; anything still silent after
+             * that is polled at 10 ms. */
             kk_nap(polls < 40 ? 2 : 10, NULL);
             polls++;
         }
@@ -6949,14 +6863,12 @@ static int shell_run(struct str command,
         if (have_marker) {
             /* completed: the session stays up for the next call */
             *exit_code = atoi(out.p + at + plen + 1);
-            /* stderr (CLIXML) often trails the marker line in the merged
-             * pipe; wait briefly for it — but only when stderr actually
-             * sent something, so clean calls pay nothing */
+            /* stderr (CLIXML) often trails the marker line in the merged pipe;
+             * wait briefly for it — but only when stderr actually sent
+             * something, so clean calls pay nothing */
             if (strstr(out.p, "#< CLIXML")) {
-                /* Give the trailing stream a deadline, not a poll count: 30
-                 * polls were 30 clock quanta, ~493 ms measured on a 34-byte
-                 * call. What the loop is really about is silence after the
-                 * last byte, so measure that in milliseconds. */
+                /* A deadline in ms, not a poll count: what the loop is really
+                 * about is silence after the last byte. */
                 DWORD quiet_since = GetTickCount();
                 for (;;) {
                     DWORD avail = 0;
@@ -7443,7 +7355,8 @@ static void session_log_compact(struct session_log *sl, size_t keep,
 static int session_load(const char *path, struct conversation *cv)
 {
     size_t len = 0;
-    char *data = file_read_all_up_to(str_from_c(path), &len, SESSION_READ_CAP);
+    char *data = file_slurp(str_from_c(path), &len, NULL, NULL,
+                            SESSION_READ_CAP, 0);
     if (!data)
         return -1;
     struct arena a;
@@ -7678,47 +7591,41 @@ static int sess_digits(const char *s, int n)
 
 static void sess_age_of(const char *fname, char *dst, size_t cap)
 {
-    if (strlen(fname) < 15 || fname[8] != '-') {
-        snprintf(dst, cap, "--");
-        return;
+    FILETIME ft, now;
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (strlen(fname) >= 15 && fname[8] == '-') {
+        y = sess_digits(fname, 4), mo = sess_digits(fname + 4, 2);
+        d = sess_digits(fname + 6, 2), h = sess_digits(fname + 9, 2);
+        mi = sess_digits(fname + 11, 2), s = sess_digits(fname + 13, 2);
     }
-    int y = sess_digits(fname, 4), mo = sess_digits(fname + 4, 2);
-    int d = sess_digits(fname + 6, 2), h = sess_digits(fname + 9, 2);
-    int mi = sess_digits(fname + 11, 2), s = sess_digits(fname + 13, 2);
-    if (y < 1601 || mo < 1 || mo > 12 || d < 1 || d > 31 || h < 0 || h > 23
-        || mi < 0 || mi > 59 || s < 0 || s > 59) {
-        snprintf(dst, cap, "--");
-        return;
+    if (y >= 1601 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && h >= 0
+        && h <= 23 && mi >= 0 && mi <= 59 && s >= 0 && s <= 59) {
+        SYSTEMTIME st = { (WORD)y, (WORD)mo, 0, (WORD)d, (WORD)h, (WORD)mi,
+                          (WORD)s, 0 };
+        SYSTEMTIME nowst;
+        GetLocalTime(&nowst);
+        if (SystemTimeToFileTime(&st, &ft)
+            && SystemTimeToFileTime(&nowst, &now)) {
+            ULARGE_INTEGER a, b;
+            a.LowPart = ft.dwLowDateTime;
+            a.HighPart = ft.dwHighDateTime;
+            b.LowPart = now.dwLowDateTime;
+            b.HighPart = now.dwHighDateTime;
+            unsigned long long secs = a.QuadPart >= b.QuadPart
+                                          ? 0
+                                          : (b.QuadPart - a.QuadPart) / 10000000ULL;
+            if (secs < 60)
+                snprintf(dst, cap, "now");
+            else if (secs < 3600)
+                snprintf(dst, cap, "%llum", secs / 60);
+            else if (secs < 86400)
+                snprintf(dst, cap, "%lluh", secs / 3600);
+            else
+                snprintf(dst, cap, "%llud", secs / 86400);
+            return;
+        }
     }
-    SYSTEMTIME st = { (WORD)y, (WORD)mo, 0, (WORD)d, (WORD)h, (WORD)mi,
-                      (WORD)s, 0 };
-    FILETIME ft;
-    if (!SystemTimeToFileTime(&st, &ft)) {
-        snprintf(dst, cap, "--");
-        return;
-    }
-    SYSTEMTIME nowst;
-    GetLocalTime(&nowst);
-    FILETIME now;
-    if (!SystemTimeToFileTime(&nowst, &now)) {
-        snprintf(dst, cap, "--");
-        return;
-    }
-    ULARGE_INTEGER a, b;
-    a.LowPart = ft.dwLowDateTime;
-    a.HighPart = ft.dwHighDateTime;
-    b.LowPart = now.dwLowDateTime;
-    b.HighPart = now.dwHighDateTime;
-    unsigned long long secs =
-        a.QuadPart >= b.QuadPart ? 0 : (b.QuadPart - a.QuadPart) / 10000000ULL;
-    if (secs < 60)
-        snprintf(dst, cap, "now");
-    else if (secs < 3600)
-        snprintf(dst, cap, "%llum", secs / 60);
-    else if (secs < 86400)
-        snprintf(dst, cap, "%lluh", secs / 3600);
-    else
-        snprintf(dst, cap, "%llud", secs / 86400);
+    snprintf(dst, cap, "--");
 }
 
 /* Scan one session file for the picker row: the first user prompt's
@@ -7730,7 +7637,8 @@ static void sess_scan_file(struct sess_row *row)
     row->preview[0] = '\0';
     row->turns = 0;
     size_t len = 0;
-    char *data = file_read_all_up_to(str_from_c(row->path), &len, 2 * 1024 * 1024);
+    char *data = file_slurp(str_from_c(row->path), &len, NULL, NULL,
+                            2 * 1024 * 1024, 0);
     if (!data)
         return;
     struct arena a;
@@ -8163,20 +8071,33 @@ static const struct {
 #define KK_N_COMMANDS (sizeof KK_COMMANDS / sizeof KK_COMMANDS[0])
 #define EDIT_MENU_MAX 8
 
-/* One dim full-width horizontal rule (cached per width). */
+/* One dim horizontal rule, cached per width: the menu/picker draw the plain
+ * form, the composer the dim-red one. Both run on the main thread. */
+static void rule_buf(struct buf *b, int red)
+{
+    static struct buf rules[2];
+    static int rule_cols[2];
+    int k = red ? 1 : 0;
+    if (rule_cols[k] != g_term_cols) {
+        buf_reset(&rules[k]);
+        buf_appends(&rules[k], red ? "\x1b[2m\x1b[31m" : "\x1b[2m");
+        /* the editor renders only when docked, which requires VT */
+        int n = red ? g_term_cols : g_term_cols - 1;
+        for (int i = 0; i < n; i++)
+            buf_appends(&rules[k], "─");
+        buf_appends(&rules[k], "\x1b[0m");
+        rule_cols[k] = g_term_cols;
+    }
+    buf_append_n(b, rules[k].p, rules[k].len);
+}
+
 static void ui_rule(int row)
 {
-    static struct buf rule;
-    static int rule_cols;
-    if (rule_cols != g_term_cols) {
-        buf_reset(&rule);
-        buf_appends(&rule, "\x1b[2m");
-        for (int i = 0; i < g_term_cols - 1; i++)
-            buf_appends(&rule, "─");
-        buf_appends(&rule, "\x1b[0m");
-        rule_cols = g_term_cols;
-    }
-    out_frame_printf("\x1b[%d;1H\x1b[2K%s", row, rule.p);
+    static struct buf b; /* main thread only, like out_frame_printf */
+    buf_reset(&b);
+    buf_appendf(&b, "\x1b[%d;1H\x1b[2K", row);
+    rule_buf(&b, 0);
+    out_frame_write(b.p, b.len);
 }
 
 /* ki's command panel: rule, header, up to cap entries from idx[from..],
@@ -8313,25 +8234,12 @@ struct edit_vrow {
     size_t len;
 };
 
-/* Full-width dim-red rule, rebuilt only when the width changes. */
 static void edit_rule_append(struct buf *frame)
 {
-    static struct buf rule; /* editor runs on the main thread only */
-    static int rule_cols;
-    if (rule_cols != g_term_cols) {
-        buf_reset(&rule);
-        /* the editor renders only when docked, which requires VT */
-        buf_appends(&rule, "\x1b[2m\x1b[31m");
-        for (int i = 0; i < g_term_cols; i++)
-            buf_appends(&rule, "─");
-        buf_appends(&rule, "\x1b[0m");
-        rule_cols = g_term_cols;
-    }
-    buf_append_n(frame, rule.p, rule.len);
+    rule_buf(frame, 1);
 }
 
-/* The visible window of the draft: visual rows [lo..lo+wcap) with the
- * cursor row kept inside. Fills rows[] (up to wcap) and reports the
+/* The visible window of the draft: visual rows [lo..lo+wcap) with the * cursor row kept inside. Fills rows[] (up to wcap) and reports the
  * cursor's row/col and the draft's total visual row count. Row breaking
  * matches edit_walk exactly (\n and auto-wrap at cols), so the cursor
  * row from edit_walk indexes into the same rows. */
@@ -8961,13 +8869,11 @@ static void menu_complete(struct editor *e)
     edit_insert(e, name, strlen(name));
 }
 
-/* Insert bytes and repaint the full frame. There is deliberately NO
- * in-place fast path: when a wrapped row fills to the terminal edge,
- * the computed cursor column and the terminal's pending-wrap state
- * disagree by one, and in-place writes then overwrite the last visible
- * character ("the paste ate a character") until the next full repaint
- * puts it back. One composed frame per keystroke is cheap and always
- * consistent. */
+/* Insert bytes and repaint the full frame. There is deliberately NO in-place
+ * fast path: when a wrapped row fills to the terminal edge, the computed
+ * cursor column and the terminal's pending-wrap state disagree by one, and
+ * in-place writes then overwrite the last visible character. One composed
+ * frame per keystroke is cheap and always consistent. */
 static void edit_put_bytes(struct editor *e, const char *s, size_t n)
 {
     e->hist_pos = (int)e->history.n; /* typing makes it the live draft */
@@ -8975,12 +8881,11 @@ static void edit_put_bytes(struct editor *e, const char *s, size_t n)
     edit_repaint(e);
 }
 
-/* Bracketed-paste collector (hax's shape): everything until ESC[201~
- * is content - CRLF folds to the draft's bare LF, NULs become spaces,
- * a 1MB cap bounds runaway pastes (bytes past it are still consumed so
- * nothing leaks into the key loop), a 5s idle gap ends a truncated
- * paste. An EMPTY body means an image-only clipboard: fall back to the
- * clipboard reader, which attaches the image. */
+/* Bracketed-paste collector: everything until ESC[201~ is content — CRLF
+ * folds to the draft's bare LF, NULs become spaces, a 1MB cap bounds runaway
+ * pastes (bytes past it are still consumed so nothing leaks into the key
+ * loop), a 5s idle gap ends a truncated paste. An EMPTY body means an
+ * image-only clipboard: fall back to the clipboard reader. */
 static void edit_collect_paste(struct editor *e)
 {
     static const char END_MARK[] = "\x1b[201~";
@@ -9036,12 +8941,11 @@ done:
     edit_repaint(e);
 }
 
-/* The composer's key loop: one raw VT byte stream decoded by hand.
- * ReadFile + ENABLE_VIRTUAL_TERMINAL_INPUT brings every sequence the
- * terminal sends - bracketed-paste markers, arrows, meta chords -
- * intact, which the INPUT_RECORD API never did (conhost's key
- * translator ate the paste markers, so multi-line paste submitted line
- * by line). */
+/* The composer's key loop: one raw VT byte stream decoded by hand. ReadFile +
+ * ENABLE_VIRTUAL_TERMINAL_INPUT brings every sequence the terminal sends —
+ * bracketed-paste markers, arrows, meta chords — intact, which the
+ * INPUT_RECORD API never did (conhost's key translator ate the paste markers,
+ * so multi-line paste submitted line by line). */
 /* Cooked line input: no VT styling or stdin is not a console — keeps
  * scripting and pipes working. */
 static enum edit_result edit_read_cooked(char **out)
@@ -9580,10 +9484,10 @@ static const char KK_SYSTEM_PROMPT[] =
     "round only when a call's arguments need an earlier call's result. "
     "Keep answers short and factual";
 
-/* The session-stable system prompt: base text plus the AGENTS.md
- * hierarchy, root-first. Returns a heap string. */
-/* A workspace snapshot: the model otherwise spends a whole round (~3 s and
- * a full context resend) discovering the tree. fff answers that from a warm
+/* The session-stable system prompt: base text plus the AGENTS.md hierarchy,
+ * root-first. Returns a heap string. */
+/* A workspace snapshot: the model otherwise spends a whole round (~3 s and a
+ * full context resend) discovering the tree. fff answers that from a warm
  * index in well under a millisecond, ranked by what this project opens most.
  * The listing is capped so a deep tree cannot inflate every later round. */
 #define SNAPSHOT_MAX 2048
@@ -9636,11 +9540,10 @@ static char *workspace_snapshot(void)
 }
 
 /* Every round re-pays the static head, and nothing used to add it up: one
- * project's AGENTS.md measured 22.9KB ≈ 6.8k tokens per round, more than
- * anything the recycling and cache work moves. Sizes are what actually got
- * appended (section headers included), pre-escape; the wire adds a few
- * percent. Printed once per interactive session, right where the prompt is
- * first built, so the number lands before the round that pays it. */
+ * project's AGENTS.md measured 22.9KB ≈ 6.8k tokens per round. Sizes are what
+ * actually got appended (section headers included), pre-escape; the wire adds
+ * a few percent. Printed once per interactive session, right where the prompt
+ * is first built, so the number lands before the round that pays it. */
 #define HEAD_BYTES_PER_TOKEN 3.4 /* median req / prompt_tokens over logs */
 static const struct buf *tools_json_block(void);
 static void head_report(size_t agents, size_t skills, size_t snap)
@@ -9865,8 +9768,8 @@ static int run_repl(struct config *cfg)
          * region itself is owned by edit_render (tracks panel height). */
         out_puts("\x1b[H\x1b[2J\x1b[3J");
         /* seed the region before the banner so the very first write
-         * bottom-aligns exactly like every later one (idle panel:
-         * 2 rules + 1 draft row + status = 4 rows) */
+         * bottom-aligns exactly like every later one (idle panel: 2 rules +
+         * 1 draft row + status = 4 rows) */
         g_region_bottom = g_term_rows - 4;
         out_frame_printf("\x1b[1;%dr", g_region_bottom);
     }
@@ -10227,6 +10130,15 @@ static int chat_stream(struct config *cfg, struct conversation *cv,
         size_t cmp = body.len < prev_body.len ? body.len : prev_body.len;
         size_t sh = 0;
         st->request_prev = prev_body.len != 0;
+        /* 8 bytes at a time: the shared prefix is usually the whole body */
+        while (sh + 8 <= cmp) {
+            uint64_t a, b;
+            memcpy(&a, body.p + sh, 8);
+            memcpy(&b, prev_body.p + sh, 8);
+            if (a != b)
+                break;
+            sh += 8;
+        }
         while (sh < cmp && body.p[sh] == prev_body.p[sh])
             sh++;
         st->request_shared = sh;
@@ -10354,13 +10266,12 @@ static size_t conv_rfind(const struct conversation *cv, const char *role)
 }
 
 /* Overflow recovery when the whole history IS the current turn (no head
- * to fold): replace earlier tool outputs with visible stubs, keeping
- * only the most recent one verbatim — tool output is the only thing
- * that can grow without bound inside one turn. The stubs are transient
- * for the retried request; the session log already holds the real
- * output it recorded, and the screen showed it live. Returns 1 when
- * something was stubbed and, if `freed` is given, reports the bytes
- * it removed from what the next request will carry. */
+ * to fold): replace earlier tool outputs with visible stubs, keeping only the
+ * most recent one verbatim — tool output is the only thing that can grow
+ * without bound inside one turn. The stubs are transient for the retried
+ * request; the session log already holds the real output it recorded, and the
+ * screen showed it live. Returns 1 when something was stubbed and, if `freed`
+ * is given, reports the bytes it removed from what the next request carries. */
 static int conv_stub_tool_results(struct conversation *cv, size_t *freed)
 {
     size_t last = conv_rfind(cv, "tool");
@@ -10401,14 +10312,13 @@ static int conv_stub_tool_results(struct conversation *cv, size_t *freed)
     return 1;
 }
 /* Routine recycling, run before every request: a tool result the model has
- * already had two rounds to use is re-paid forever otherwise. Corpus
- * numbers: re-sent history is 26x the generated text, one 49-round turn paid
- * 1.0M tokens mostly from 20-60KB read results it stopped looking at. The
+ * already had two rounds to use is re-paid forever otherwise (corpus numbers:
+ * re-sent history is 26x the generated text, one 49-round turn paid 1.0M
+ * tokens mostly from 20-60KB read results it stopped looking at). The
  * two-round slack guarantees the model never loses output it has not seen,
- * and anything recycled is one call away from being fetched back.
- * `min_rounds` counts assistant messages after the result — every one of
- * them is a request that already carried it; `min_bytes` skips results too
- * small to be worth a re-run. */
+ * and anything recycled is one call away from being fetched back. `min_rounds`
+ * counts assistant messages after the result — every one of them is a request
+ * that already carried it; `min_bytes` skips results too small to re-run. */
 static int conv_recycle_tool_results(struct conversation *cv, size_t *freed,
                                      size_t min_bytes, size_t min_rounds)
 {
@@ -10720,7 +10630,7 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
                 break; /* a partial stream must not be replayed */
             if (++attempt >= 3)
                 break;
-            /* and a wall-clock budget beside the attempt count: one refused
+            /* A wall-clock budget beside the attempt count: one refused
              * connect costs the OS ~2s, a blackholed one the whole connect
              * timeout, so three blind retries held a dead endpoint for a
              * minute before saying so. Fast failures still get all three
@@ -10750,28 +10660,28 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             out_puts("\r\x1b[0K"); /* erase the wait spinner residue */
         renderer_end_turn(&g_renderer);
 
-            if (st.looped) {
-                /* the repeated text is dropped, not kept: holding it would
-                 * make every later round pay for the loop just broken */
-                out_puts("⚠ 检测到输出重复循环，已中断本轮（该回复未保留）\r\n");
+        if (st.looped) {
+            /* the repeated text is dropped, not kept: holding it would
+             * make every later round pay for the loop just broken */
+            out_puts("⚠ 检测到输出重复循环，已中断本轮（该回复未保留）\r\n");
+            stream_state_free(&st);
+            rc = 1;
+            break;
+        }
+        if (status == -1) {
+            if (InterlockedCompareExchange(&g_steer, 0, 0)) {
+                /* enter steer: the new text becomes the user turn
+                 * the model answers right now */
+                InterlockedExchange(&g_steer, 0);
                 stream_state_free(&st);
-                rc = 1;
-                break;
+                turn_feed_queue(cv, slog);
+                continue;
             }
-            if (status == -1) {
-                if (InterlockedCompareExchange(&g_steer, 0, 0)) {
-                    /* enter steer: the new text becomes the user turn
-                     * the model answers right now */
-                    InterlockedExchange(&g_steer, 0);
-                    stream_state_free(&st);
-                    turn_feed_queue(cv, slog);
-                    continue;
-                }
-                out_puts("^C 已中断\r\n");
-                stream_state_free(&st);
-                rc = 130;
-                break;
-            }
+            out_puts("^C 已中断\r\n");
+            stream_state_free(&st);
+            rc = 130;
+            break;
+        }
         if (st.error) {
             /* a context-overflow rejection arrives before any byte
              * streams, so folding the history and replaying the request
@@ -10809,13 +10719,13 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
             rc = 1;
             break;
         }
-        /* A 200 whose stream ended with no finish_reason, no usage chunk
-         * and no [DONE] was closed by the peer mid-answer. The transport
-         * cannot see it — WinHTTP reports a clean EOF either way — so the
-         * reply would sit there stopping mid-word with nothing said, which
-         * reads as a rendering bug. Say it, and leave the fact in the
-         * message the model reads next round: display == model view for
-         * truncation too, and "继续" then continues instead of guessing. */
+        /* A 200 whose stream ended with no finish_reason, no usage chunk and
+         * no [DONE] was closed by the peer mid-answer. The transport cannot
+         * see it — WinHTTP reports a clean EOF either way — so the reply would
+         * sit there stopping mid-word with nothing said, which reads as a
+         * rendering bug. Say it, and leave the fact in the message the model
+         * reads next round: display == model view for truncation too, and
+         * "继续" then continues instead of guessing. */
         if (status == 200 && st.finish == FINISH_NONE && !st.got_usage
             && (st.content.len || st.reasoning.len || st.n_calls)) {
             out_puts("⚠ 回复在传输中被提前关闭，内容不完整\r\n");
@@ -10889,16 +10799,16 @@ static int agent_loop(struct config *cfg, struct conversation *cv,
         struct tool_call_rec *calls = m->calls;
         size_t n_calls = m->n_calls;
 
-        /* a tools-only response fires no text hooks, so g_busy still
-         * reads 1 (waiting): the spinner must go quiet before the tool
-         * lines print, or it stamps over them */
+        /* a tools-only response fires no text hooks, so g_busy still reads 1
+         * (waiting): the spinner must go quiet before the tool lines print,
+         * or it stamps over them */
         InterlockedExchange(&g_busy, 2);
-        /* Leading read-only calls run in parallel: the model emits them in
-         * one batch precisely because they are independent, and a read is a
-         * pure I/O wait. Only the leading run of reads qualifies — a read
-         * sitting behind a write in the same batch may be meant to see that
-         * write's result. Results still join, display and log in call order:
-         * display == model view. */
+        /* Leading read-only calls run in parallel: the model emits them in one
+         * batch precisely because they are independent, and a read is a pure
+         * I/O wait. Only the leading run of reads qualifies — a read sitting
+         * behind a write in the same batch may be meant to see that write's
+         * result. Results still join, display and log in call order: display
+         * == model view. */
         size_t n_para = 0;
         while (n_para < n_calls && strcmp(calls[n_para].name, "read") == 0)
             n_para++;
@@ -11194,15 +11104,11 @@ static int run_prompt(struct config *cfg, const char *prompt, int cont)
 }
 
 /* --- crash diagnostics: a text scene of the fault ------------------------ */
-/* A crash must leave something behind. MiniDumpWriteDump cannot do it on
- * this machine: measured with a standalone probe it returns
- * ERROR_INVALID_PARAMETER (0x80070057) for every argument variant — with or
- * without exception info, ClientPointers 0/1, ThreadId 0,
- * MiniDumpWithHandleData, a real OpenProcess handle instead of the pseudo
- * one — and it fails the same way from a healthy process, so the promised
- * .dmp was always 0 bytes. What has no such dependency is our own stack:
+/* A crash must leave something behind. MiniDumpWriteDump cannot do it on this
+ * machine (measured with a standalone probe: ERROR_INVALID_PARAMETER for
+ * every argument variant, and the same failure from a healthy process), so
  * this writes the exception code, the address touched, the faulting
- * instruction and the return addresses as RVAs, which kk.pdb names offline.
+ * instruction and the return addresses as RVAs, which kk.map names offline.
  * Static buffers and one WriteFile each: the allocator may be what died, and
  * a handler runs on whatever stack is left. */
 static LONG WINAPI kk_crash_filter(EXCEPTION_POINTERS *ep)
@@ -11255,16 +11161,16 @@ int wmain(int argc, wchar_t **wargv)
     term_init();
     dirs_init();
 
-    /* pre-index the workspace while the user is still typing; a no-op
-     * thread when fff.dll is absent */
-    HANDLE fff_warm = CreateThread(NULL, 0, fff_warmup, NULL, 0, NULL);
-    if (fff_warm)
-        CloseHandle(fff_warm);
-    /* the shell session warms in the background too: a synchronous spawn
-     * held every startup hostage to ~1.1s of PowerShell cold start */
-    HANDLE ps_warm = CreateThread(NULL, 0, ps_prewarm, NULL, 0, NULL);
-    if (ps_warm)
-        CloseHandle(ps_warm);
+    /* pre-index the workspace while the user is still typing; a no-op thread
+     * when fff.dll is absent. The shell session warms in the background too:
+     * a synchronous spawn held every startup hostage to ~1.1s of PowerShell
+     * cold start */
+    HANDLE warm[2];
+    warm[0] = CreateThread(NULL, 0, fff_warmup, NULL, 0, NULL);
+    warm[1] = CreateThread(NULL, 0, ps_prewarm, NULL, 0, NULL);
+    for (int i = 0; i < 2; i++)
+        if (warm[i])
+            CloseHandle(warm[i]);
 
     /* CRT argv decodes the ANSI codepage; take the wide command line and
      * convert to UTF-8 so every byte after this point is UTF-8. */
