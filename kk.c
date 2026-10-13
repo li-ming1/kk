@@ -10210,6 +10210,39 @@ static DWORD WINAPI agent_thread_proc(LPVOID arg)
     return 0;
 }
 
+/* Start a turn on the agent thread: goal == NULL runs one turn, goal != NULL
+ * runs the /goal loop with that task as its first user turn. Both dispatch
+ * sites used to fill these five fields by hand, and the ordinary-turn one never
+ * set `goal` — xmalloc does not zero, so agent_thread_proc's `if (a->goal)`
+ * branched on whatever the recycled chunk held (a -1 from an old handle is the
+ * usual guest) and jumped into goal_loop with a bogus task pointer. One place
+ * to add a field, one place that cannot forget it. */
+static void agent_start(struct config *cfg, struct conversation *cv,
+                        struct session_log *slog, const char *sysp,
+                        const char *goal)
+{
+    if (g_agent_thread)
+        CloseHandle(g_agent_thread); /* previous turn, reaped */
+    struct agent_args *aa = xmalloc(sizeof *aa);
+    aa->cfg = cfg;
+    aa->cv = cv;
+    aa->slog = slog;
+    aa->sysp = sysp;
+    aa->goal = goal ? xstrdup(goal) : NULL;
+    g_agent_thread = CreateThread(NULL, 0, agent_thread_proc, aa, 0, NULL);
+    if (g_agent_thread)
+        return;
+    /* no thread available: run it right here. The goal path still owns the
+     * task text as a user turn; the queued text of a normal turn still feeds
+     * through turn_feed_queue. */
+    free(aa->goal);
+    free(aa);
+    if (goal)
+        goal_loop(cfg, cv, slog, sysp, goal);
+    else
+        agent_loop(cfg, cv, slog, sysp, 1);
+}
+
 /* Queue one line as pending user input (turn start or mid-turn steer). */
 static void queue_user_line(const char *line)
 {
@@ -10348,22 +10381,7 @@ static int run_repl(struct config *cfg)
                 out_printf("未设置模型：请设置 KK_MODEL 或在 %s\\config 里配置\r\n",
                            g_appdata_dir);
             } else if (dock) {
-                if (g_agent_thread)
-                    CloseHandle(g_agent_thread); /* previous turn, reaped */
-                struct agent_args *aa = xmalloc(sizeof *aa);
-                aa->cfg = cfg;
-                aa->cv = &cv;
-                aa->slog = &slog;
-                aa->sysp = sysp;
-                aa->goal = xstrdup(task);
-                g_agent_thread = CreateThread(NULL, 0, agent_thread_proc, aa,
-                                              0, NULL);
-                if (!g_agent_thread) {
-                    /* no thread available: run the goal synchronously */
-                    free(aa->goal);
-                    free(aa);
-                    goal_loop(cfg, &cv, &slog, sysp, task);
-                }
+                agent_start(cfg, &cv, &slog, sysp, task);
             } else {
                 /* non-dock console: synchronous goal */
                 goal_loop(cfg, &cv, &slog, sysp, task);
@@ -10379,21 +10397,7 @@ static int run_repl(struct config *cfg)
              * g_queued (turn_feed_queue echoes it as the cyan bars) and
              * the composer keeps running right here */
             queue_user_line(line);
-            if (g_agent_thread)
-                CloseHandle(g_agent_thread); /* previous turn, reaped */
-            struct agent_args *aa = xmalloc(sizeof *aa);
-            aa->cfg = cfg;
-            aa->cv = &cv;
-            aa->slog = &slog;
-            aa->sysp = sysp;
-            g_agent_thread = CreateThread(NULL, 0, agent_thread_proc, aa, 0,
-                                          NULL);
-            if (!g_agent_thread) {
-                /* no thread available: run the turn synchronously, the
-                 * queued text still feeds through turn_feed_queue */
-                free(aa);
-                agent_loop(cfg, &cv, &slog, sysp, 1);
-            }
+            agent_start(cfg, &cv, &slog, sysp, NULL);
         } else {
             /* non-dock console: synchronous turn */
             struct message *um = conv_add(&cv, "user", line);
