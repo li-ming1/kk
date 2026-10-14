@@ -198,6 +198,10 @@ by keeping the exact bytes that were sent.
 search toolkit by Dmitriy Kovalenko and contributors, MIT licensed. `fff.h` here is
 its cbindgen-generated C ABI, and `fff.dll` is loaded at runtime, not linked.
 
+`fff.dll` is that project's v0.11.0 Windows build, renamed:
+
+<https://github.com/dmtrKovalenko/fff/releases/download/v0.11.0/x86_64-pc-windows-msvc.dll>
+
 ## Repository
 
 ```

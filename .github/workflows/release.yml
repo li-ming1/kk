@@ -1,0 +1,47 @@
+name: release
+
+# Tag a version: this builds kk.exe, fetches fff.dll, and attaches both to the
+# GitHub release. Nothing else gets published - kk.c is the program, so the exe
+# IS the deliverable.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build kk.exe
+        run: cmd /c build.bat
+
+      - name: Fetch fff.dll
+        shell: cmd
+        run: curl.exe -L -o fff.dll https://github.com/dmtrKovalenko/fff/releases/download/v0.11.0/x86_64-pc-windows-msvc.dll
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @'
+          **kk** - a single-file Windows coding agent for your terminal. One C file,
+          one .exe, no runtime.
+
+          | Asset | What it is |
+          | --- | --- |
+          | `kk.exe` | The whole program. Static CRT; nothing needed beyond Windows 10 1903+. |
+          | `fff.dll` | Optional. Powers the `find` and `grep` tools, loaded at runtime. |
+
+          Drop both in one directory and run `kk`. `fff.dll` is the Windows build of
+          [fff](https://github.com/dmtrKovalenko/fff) v0.11.0 (MIT), renamed.
+
+          Point it at an endpoint with `--base` / `--key` / `--model`, the `KK_*`
+          environment variables, or `%APPDATA%\kk\config`. `kk --help` lists the rest.
+          '@
+          gh release create $env:GITHUB_REF_NAME kk.exe fff.dll --title "kk $env:GITHUB_REF_NAME" --notes $notes
