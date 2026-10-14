@@ -1221,6 +1221,23 @@ invalid:
     return 0;
 }
 
+/* The shape every UTF-8 walk in this file wants: the codepoint and its byte
+ * length, with the length forced to at least 1 so a malformed byte still
+ * advances the walk instead of spinning on it. */
+static size_t u8_step(const char *s, size_t n, uint32_t *cp)
+{
+    size_t len = u8_decode(s, n, cp);
+    return len ? len : 1;
+}
+
+/* Same, for the walks that only split: the caret paints a whole glyph and
+ * never asks what it is. */
+static size_t u8_len(const char *s, size_t n)
+{
+    uint32_t cp;
+    return u8_step(s, n, &cp);
+}
+
 /* Encode cp as UTF-8 into tmp (at least 4 bytes); returns bytes used. */
 static size_t u8_encode(uint32_t cp, char *tmp)
 {
@@ -1395,9 +1412,7 @@ static size_t visible_width(const char *s, size_t n)
             continue;
         }
         uint32_t cp;
-        size_t clen = u8_decode(s + i, n - i, &cp);
-        if (clen == 0)
-            clen = 1;
+        size_t clen = u8_step(s + i, n - i, &cp);
         w += (size_t)u8_cp_width(cp);
         i += clen;
     }
@@ -1810,9 +1825,7 @@ static void trunc_cols(char *dst, size_t cap, const char *src, int max_cols)
     int w = 0, cut = 0;
     while (i < n && o + 8 < cap) {
         uint32_t cp;
-        size_t clen = u8_decode(src + i, n - i, &cp);
-        if (clen == 0)
-            clen = 1;
+        size_t clen = u8_step(src + i, n - i, &cp);
         int cw = u8_cp_width(cp);
         if (w + cw > max_cols) {
             cut = 1;
@@ -1991,9 +2004,7 @@ static void user_bars_buf(struct buf *out, const char *text, size_t len)
             brk = 1;
         } else {
             uint32_t cp;
-            size_t cl = u8_decode(text + i, len - i, &cp);
-            if (cl == 0)
-                cl = 1;
+            size_t cl = u8_step(text + i, len - i, &cp);
             size_t cw = (size_t)u8_cp_width(cp);
             if (w + cw > wrap && w > 0)
                 brk = 1; /* w == 0: the char alone exceeds the row, keep it */
@@ -2734,9 +2745,7 @@ static void painter_append_styled(struct painter *p, const char *s, size_t n)
                     }
                 } else {
                     uint32_t cp;
-                    clen = u8_decode(s + i, n - i, &cp);
-                    if (clen == 0)
-                        clen = 1;
+                    clen = u8_step(s + i, n - i, &cp);
                     cw = (size_t)u8_cp_width(cp);
                 }
                 if (take_width + cw > (size_t)room)
@@ -3097,9 +3106,7 @@ static void rd_probe_flush(struct renderer *r)
     size_t i = 0;
     while (i < b.len) {
         uint32_t cp;
-        size_t clen = u8_decode(b.p + i, b.len - i, &cp);
-        if (clen == 0)
-            clen = 1;
+        size_t clen = u8_step(b.p + i, b.len - i, &cp);
         rd_feed_char(r, cp);
         i += clen;
     }
@@ -3276,9 +3283,7 @@ static int tbl_delim_cols(const char *s, size_t len)
             return 0;
         for (size_t k = a; k < b;) {
             uint32_t dash;
-            size_t dl = u8_decode(c + k, b - k, &dash);
-            if (dl == 0)
-                dl = 1;
+            size_t dl = u8_step(c + k, b - k, &dash);
             if (dash != '-' && dash != 0x2500)
                 return 0;
             k += dl;
@@ -3318,14 +3323,9 @@ static void tbl_cell_styled(struct buf *out, const char *s, size_t n, int bold_b
     uint32_t cp = 0, next = 0;
     size_t clen = 0, nlen = 0;
     if (n) {
-        clen = u8_decode(s, n, &cp);
-        if (clen == 0)
-            clen = 1;
-        if (i + clen < n) {
-            nlen = u8_decode(s + clen, n - clen, &next);
-            if (nlen == 0)
-                nlen = 1;
-        }
+        clen = u8_step(s, n, &cp);
+        if (i + clen < n)
+            nlen = u8_step(s + clen, n - clen, &next);
     }
     while (i < n) {
         size_t adv; /* bytes consumed from s this iteration */
@@ -3393,13 +3393,9 @@ static void tbl_cell_styled(struct buf *out, const char *s, size_t n, int bold_b
         /* slide the one-decode lookahead forward */
         if (adv > clen) { /* the lookahead was swallowed: reload both */
             if (i < n) {
-                clen = u8_decode(s + i, n - i, &cp);
-                if (clen == 0)
-                    clen = 1;
+                clen = u8_step(s + i, n - i, &cp);
                 if (i + clen < n) {
-                    nlen = u8_decode(s + i + clen, n - i - clen, &next);
-                    if (nlen == 0)
-                        nlen = 1;
+                    nlen = u8_step(s + i + clen, n - i - clen, &next);
                 } else {
                     nlen = 0;
                     next = 0;
@@ -3410,11 +3406,8 @@ static void tbl_cell_styled(struct buf *out, const char *s, size_t n, int bold_b
             clen = nlen;
             nlen = 0;
             next = 0;
-            if (i < n && i + clen < n) {
-                nlen = u8_decode(s + i + clen, n - i - clen, &next);
-                if (nlen == 0)
-                    nlen = 1;
-            }
+            if (i < n && i + clen < n)
+                nlen = u8_step(s + i + clen, n - i - clen, &next);
         }
     }
 }
@@ -3966,9 +3959,7 @@ static void rd_feed_text(struct renderer *r, const char *s, size_t n)
     size_t i = 0;
     while (i < n) {
         uint32_t cp;
-        size_t clen = u8_decode(s + i, n - i, &cp);
-        if (clen == 0)
-            clen = 1;
+        size_t clen = u8_step(s + i, n - i, &cp);
         i += clen;
         if (r->fence) {
             rd_fence_char(r, cp);
@@ -5833,9 +5824,7 @@ static void buf_append_line_capped_pfx(struct buf *out, const char *pre,
             continue;
         }
         uint32_t cp;
-        size_t clen = u8_decode(s + i, n - i, &cp);
-        if (clen == 0)
-            clen = 1;
+        size_t clen = u8_step(s + i, n - i, &cp);
         if (w + (int)u8_cp_width(cp) > KK_LINE_COLS)
             break;
         buf_append_n(out, s + i, clen);
@@ -8731,9 +8720,7 @@ static int edit_row_step(const char *s, size_t len, size_t cols, size_t *off,
             continue;
         }
         uint32_t cp;
-        size_t cl = u8_decode(s + i, len - i, &cp);
-        if (cl == 0)
-            cl = 1;
+        size_t cl = u8_step(s + i, len - i, &cp);
         size_t cw = (size_t)u8_cp_width(cp);
         if (*col + cw > cols)
             break;
@@ -8919,16 +8906,12 @@ static void edit_render(struct editor *e)
             size_t at = 0, w = 0;
             while (at < rlen && w < cur_col) {
                 uint32_t cp;
-                size_t cl = u8_decode(rs + at, rlen - at, &cp);
-                if (!cl)
-                    cl = 1;
+                size_t cl = u8_step(rs + at, rlen - at, &cp);
                 w += u8_cp_width(cp);
                 at += cl;
             }
             if (at < rlen) {
-                size_t cl = u8_decode(rs + at, rlen - at, &(uint32_t){0});
-                if (!cl)
-                    cl = 1;
+                size_t cl = u8_len(rs + at, rlen - at);
                 buf_append_n(&frame, rs, at);
                 buf_appends(&frame, "\x1b[7m");
                 buf_append_n(&frame, rs + at, cl);
@@ -9097,9 +9080,7 @@ static size_t edit_row_at(const struct editor *e, int trow, size_t tcol)
             continue;
         }
         uint32_t cp;
-        size_t cl = u8_decode(e->text.p + off, e->text.len - off, &cp);
-        if (cl == 0)
-            cl = 1;
+        size_t cl = u8_step(e->text.p + off, e->text.len - off, &cp);
         size_t cw = (size_t)u8_cp_width(cp);
         if (w + cw > cols)
             break;
@@ -9624,14 +9605,11 @@ static enum edit_result edit_line(struct editor *e, char **out)
                     moved = 1;
                     break;
                 case '~':
-                    if (np == 1 && (params[0] == '1' || params[0] == '7')) {
-                        e->cur = 0;
-                        moved = 1;
-                    } else if (np == 1
-                               && (params[0] == '4' || params[0] == '8')) {
-                        e->cur = e->text.len;
-                        moved = 1;
-                    } else if (np == 1 && params[0] == '3') {
+                    /* ESC [ 3 ~ (Delete) is the only member of the ~ family
+                     * left: conhost and Windows Terminal both send Home/End as
+                     * ESC [ H / ESC [ F (handled above), and Ctrl+A/Ctrl+E
+                     * already cover the line ends for every other terminal. */
+                    if (np == 1 && params[0] == '3') {
                         edit_undo_save(e);
                         edit_delete_at(e);
                     }
@@ -11856,11 +11834,18 @@ static const char KK_HELP[] =
     "  --base URL          API 地址（环境变量 KK_BASE_URL）\r\n"
     "  --key KEY           API 密钥（环境变量 KK_API_KEY）\r\n"
     "  --model MODEL       模型 id（环境变量 KK_MODEL）\r\n"
-    "  --version, --help\r\n"
+    "  --version           打印版本\r\n"
+    "  -h, --help          打印本帮助\r\n"
     "不带参数启动交互式 REPL。\r\n"
-    "环境变量：KK_MAX_OUTPUT_TOKENS 输出上限、KK_CONTEXT_WINDOW 假定窗口、\r\n"
+    "环境变量（也可用 %APPDATA%\\kk\\config 写前三项）：\r\n"
+    "  KK_BASE_URL / KK_API_KEY / KK_MODEL  连接与模型\r\n"
+    "  KK_MAX_OUTPUT_TOKENS 单次输出上限（默认 32768）；KK_CONTEXT_WINDOW\r\n"
+    "    假定的上下文窗口（默认 262144）；KK_READ_MAX_BYTES read 单页上限\r\n"
+    "    （默认 65536）\r\n"
+    "  KK_IMG_MAX_EDGE 贴图长边像素上限（默认 1568，<64 关闭）；\r\n"
+    "    KK_IMG_MAX_BYTES 贴图 base64 后上限（默认 8MB）\r\n"
     "  KK_DUMP_REQ=<路径> 把每次发出的请求体覆盖写到该文件（查「这轮为什么\r\n"
-    "  比日志里的消息大」），KK_FORCE_CONSOLE 重定向下仍按 VT 输出（测试用）。\r\n";
+    "    比日志里的消息大」）；KK_FORCE_CONSOLE 重定向下仍按 VT 输出（测试用）\r\n";
 
 static void config_print_missing(const struct config *cfg)
 {
@@ -11957,6 +11942,15 @@ static LONG WINAPI kk_crash_filter(EXCEPTION_POINTERS *ep)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+/* A malformed command line. The prewarm shell inherited our stdio pipes, so it
+ * has to die before the process returns or a reader waits forever for EOF. */
+static int flag_error(const char *flag, const char *why)
+{
+    fprintf(stderr, "kk: %s %s（见 --help）\n", flag, why);
+    ps_kill();
+    return 2;
+}
+
 int wmain(int argc, wchar_t **wargv)
 {
     SetUnhandledExceptionFilter(kk_crash_filter);
@@ -12000,9 +11994,10 @@ int wmain(int argc, wchar_t **wargv)
             out_printf("kk " KK_VERSION "\r\n");
             ps_kill();
             return 0;
-        } else if (i + 1 < argc && (strcmp(a, "--base") == 0
-                                    || strcmp(a, "--key") == 0
-                                    || strcmp(a, "--model") == 0)) {
+        } else if (strcmp(a, "--base") == 0 || strcmp(a, "--key") == 0
+                   || strcmp(a, "--model") == 0) {
+            if (i + 1 >= argc)
+                return flag_error(a, "缺少取值");
             char **slot = strcmp(a, "--base") == 0 ? &cfg.base_url
                           : strcmp(a, "--key") == 0 ? &cfg.api_key
                                                     : &cfg.model;
@@ -12011,12 +12006,13 @@ int wmain(int argc, wchar_t **wargv)
         } else if (strcmp(a, "-c") == 0 || strcmp(a, "--continue") == 0) {
             cont = 1;
         } else if (strcmp(a, "-p") == 0 || strcmp(a, "--prompt") == 0) {
-            if (i + 1 < argc)
-                prompt = argv[++i];
+            /* a missing value is an error, never a silent skip: `kk -p` used
+             * to fall through to the REPL as if the flag had not been typed */
+            if (i + 1 >= argc)
+                return flag_error(a, "缺少取值");
+            prompt = argv[++i];
         } else if (a[0] == '-') {
-            fprintf(stderr, "kk: 未知参数 %s（见 --help）\n", a);
-            ps_kill();
-            return 2;
+            return flag_error(a, "未知参数");
         } else {
             prompt = a;
         }

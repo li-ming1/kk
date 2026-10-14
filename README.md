@@ -2,7 +2,7 @@
 
 A Windows coding agent that lives in your terminal — one C file, one `.exe`, no runtime.
 
-`kk.c` is a single translation unit (~10.4k lines) built with MSVC against Win32 +
+`kk.c` is a single translation unit (~12k lines) built with MSVC against Win32 +
 the CRT only: WinHTTP for transport, hand-written JSON / UTF-8 / Markdown / SSE,
 console VT rendering. No package manager, no interpreter, no bundled runtime.
 It talks to any OpenAI-compatible `/chat/completions` endpoint that streams SSE and
@@ -60,15 +60,18 @@ Other environment variables:
 | `KK_CONTEXT_WINDOW` | Assumed context window in tokens (default 262144) |
 | `KK_DUMP_REQ=<path>` | Overwrite that file with every request body, verbatim |
 | `KK_FORCE_CONSOLE` | Emit VT even when stdout is redirected (for testing) |
+| `KK_READ_MAX_BYTES` | Byte cap on one `read` page (default 65536) |
 | `KK_IMG_MAX_EDGE` | Long-edge cap for pasted images before PNG encoding (default 1568; below 64 disables) |
+| `KK_IMG_MAX_BYTES` | Cap on a pasted image's base64 length (default 8 MB) |
 
 Images are capped at 1568px on the long edge (bilinear, aspect preserved)
 before encoding: vision endpoints downscale past that themselves and refuse
 base64 bodies over 5–10MB, so a 4K screenshot would otherwise encode to a
 ~25MB PNG — a ~33MB request that gets rejected, or costs 2–3x the tokens.
 
-`--help` and `--version` finish the flag list. Unknown flags exit `2`; a turn
-cancelled with Ctrl+C exits `130`.
+`-h` / `--help` and `--version` finish the flag list. An unknown flag, or a
+value-taking flag with no value, exits `2`; a turn cancelled with Ctrl+C exits
+`130`.
 
 ## What it gives the model
 
@@ -189,13 +192,11 @@ kk.c         the whole program
 fff.h        C ABI of the fff search library (types only; resolved via LoadLibrary)
 build.bat    MSVC build
 kk.manifest  UTF-8 process codepage
-help.md      design doctrine: what may be deleted, what must not
 LICENSE      MIT
 ```
 
-The rules the code follows are in `help.md`: full features, minimal implementation
-— delete before refactor, merge before abstract, and every layer has to answer why
-it exists.
+The rules the code follows: full features, minimal implementation — delete before
+refactor, merge before abstract, and every layer has to answer why it exists.
 
 ## License
 
