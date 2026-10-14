@@ -194,19 +194,9 @@ by keeping the exact bytes that were sent.
 
 ## Credits
 
-`find` and `grep` are powered by **[fff](https://github.com/dmtrKovalenko/fff)** — a
-file search toolkit for humans and AI agents, by Dmitriy Kovalenko and contributors,
-MIT licensed and open source forever. It keeps a typo-resistant path and content
-index resident in one long-lived process, which is why it beats a `ripgrep` spawn on
-the second search of a session; it also powers file search in
-[opencode](https://github.com/anomalyco/opencode) and
-[nushell](https://github.com/nushell/nushell).
-
-`fff.h` in this repository is cbindgen output from that project's `fff-c` crate —
-types only. `kk` never links against it: the DLL is loaded lazily on the first
-`find`/`grep` call and every entry point is resolved through `LoadLibrary`, so a
-missing or older `fff.dll` costs you two tools and nothing else. Drop `fff.dll` beside
-`kk.exe` to enable them.
+`find` and `grep` are powered by [fff](https://github.com/dmtrKovalenko/fff) — a file
+search toolkit by Dmitriy Kovalenko and contributors, MIT licensed. `fff.h` here is
+its cbindgen-generated C ABI, and `fff.dll` is loaded at runtime, not linked.
 
 ## Repository
 
